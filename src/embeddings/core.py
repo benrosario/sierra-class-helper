@@ -115,6 +115,26 @@ else:
     with open(metadata_file, "w", encoding="utf-8") as f:
         json.dump(id_to_course_list, f, indent=2)
 
+# Extract valid subject codes from loaded course data
+def get_valid_subjects() -> set:
+    """
+    Extract all unique subject codes from the loaded course data.
+
+    Returns:
+        Set of valid subject codes (e.g., {'MATH', 'CSCI', 'ENGL', ...})
+    """
+    subjects = set()
+    for entry in id_to_course_list:
+        course = entry.get("course", {})
+        subject = course.get("subject", "")
+        if subject:
+            subjects.add(subject)
+    return subjects
+
+# Initialize valid subjects cache (computed once at startup)
+VALID_SUBJECTS = get_valid_subjects()
+logger.info(f"Loaded {len(VALID_SUBJECTS)} valid subject codes")
+
 def normalize_course_query(query: str) -> str:
     """
     Normalize course queries to improve search accuracy
@@ -141,13 +161,14 @@ def normalize_course_query(query: str) -> str:
 
 def extract_course_code(query: str) -> tuple[str, str]:
     """
-    Extract subject and course number from query
-    Returns (subject, course_number) or (None, None) if not found
+    Extract subject and course number from query, validating against real subject codes.
+    Returns (subject, course_number) or (None, None) if not found or invalid.
 
     Examples:
-    - "CHEM 1B" -> ("CHEM", "0001B")
-    - "CS 50" -> ("CS", "0050")
-    - "math classes" -> (None, None)
+    - "CHEM 1B" -> ("CHEM", "0001B")  # CHEM is valid
+    - "MATH 31" -> ("MATH", "0031")   # MATH is valid
+    - "CALC 2" -> (None, None)        # CALC is not a valid subject code
+    - "math classes" -> (None, None)  # No pattern match
     """
     # Pattern: Subject (2-4 letters) followed by course number (1-4 digits + optional letter)
     import re
@@ -157,6 +178,11 @@ def extract_course_code(query: str) -> tuple[str, str]:
     if match:
         subject = match.group(1)
         number = match.group(2)
+
+        # Validate subject code against actual course subjects
+        if subject not in VALID_SUBJECTS:
+            logger.info(f"Rejected course code '{subject} {number}' - '{subject}' is not a valid subject code")
+            return (None, None)
 
         # Normalize course number to 4 digits + letter format (e.g., "1B" -> "0001B")
         if number[-1].isalpha():
@@ -223,7 +249,7 @@ def detect_subject_preference(query: str) -> str | None:
 
     return None
 
-def search_courses(query: str, k: int = 3) -> list[dict]:
+def search_courses(query: str, k: int = 3, subject_hint: str = None) -> list[dict]:
     """
     Search for courses using exact match + semantic similarity.
 
@@ -233,6 +259,8 @@ def search_courses(query: str, k: int = 3) -> list[dict]:
     Args:
         query: Natural language search query
         k: Number of results to return
+        subject_hint: Optional subject area hint from intent extraction (e.g., "Music", "Computer Science")
+                     This overrides automatic subject detection for better accuracy.
 
     Returns:
         List of course dictionaries
@@ -244,8 +272,96 @@ def search_courses(query: str, k: int = 3) -> list[dict]:
         # Try to extract exact course code
         subject, course_number = extract_course_code(normalized_query)
 
-        # Detect subject preference (e.g., "math" in "discrete math courses")
-        preferred_subject = detect_subject_preference(normalized_query) if not subject else None
+        # Detect subject preference - use hint if provided, otherwise auto-detect
+        if subject_hint:
+            # Map subject hint to subject code (e.g., "Music" -> "MUS")
+            # Complete mapping of natural language subject names to subject codes (all 62 subjects)
+            subject_mapping = {
+                # Common aliases
+                "math": "MATH",
+                "psych": "PSYC",
+                "cs": "CSCI",
+                "theater": "THEA",
+                "theatre": "THEA",
+                "nursing": "NRSR",
+                "esl": "ESL",
+                # Full subject names from course data
+                "applied art and design": "AAD",
+                "administration of justice": "ADMJ",
+                "advanced manufacturing": "ADVM",
+                "agriculture": "AGRI",
+                "allied health": "ALH",
+                "anthropology": "ANTH",
+                "art history": "ARHI",
+                "art": "ART",
+                "astronomy": "ASTR",
+                "athletics": "ATHL",
+                "automotive technology": "AUTO",
+                "automotive": "AUTO",
+                "building industries": "BI",
+                "biological sciences": "BIOL",
+                "biology": "BIOL",
+                "business": "BUS",
+                "chemistry": "CHEM",
+                "communication studies": "COMM",
+                "communication": "COMM",
+                "computer science": "CSCI",
+                "deaf studies": "DFST",
+                "economics": "ECON",
+                "education": "EDU",
+                "english": "ENGL",
+                "engineering": "ENGR",
+                "earth science": "ESCI",
+                "english as a second language": "ESL",
+                "environmental sciences": "ESS",
+                "ethnic studies": "ETHN",
+                "fashion": "FASH",
+                "fire technology": "FIRE",
+                "fire science": "FIRE",
+                "french": "FREN",
+                "geography": "GEOG",
+                "german": "GER",
+                "human development and family": "HDEV",
+                "health education": "HED",
+                "history": "HIST",
+                "health sciences": "HSCI",
+                "humanities": "HUM",
+                "information technology": "IT",
+                "italian": "ITAL",
+                "japanese": "JPN",
+                "kinesiology": "KIN",
+                "lgbt studies": "LGBT",
+                "mathematics": "MATH",
+                "mechatronics": "MECH",
+                "music": "MUS",
+                "nursing assistant": "NRSA",
+                "nursing registered": "NRSR",
+                "nutrition and food science": "NUTF",
+                "nutrition": "NUTF",
+                "personal development": "PDEV",
+                "philosophy": "PHIL",
+                "photography": "PHOT",
+                "physics": "PHYS",
+                "political science": "POLS",
+                "psychology": "PSYC",
+                "recreation management": "RECM",
+                "rise": "RISE",
+                "skill development": "SKDV",
+                "sociology": "SOC",
+                "spanish": "SPAN",
+                "statistics": "STAT",
+                "theatre arts": "THEA",
+                "welding technology": "WELD",
+                "welding": "WELD",
+                "women's studies": "WMST",
+            }
+            preferred_subject = subject_mapping.get(subject_hint.lower())
+            if preferred_subject:
+                logger.info(f"Using subject hint from intent: {subject_hint} -> {preferred_subject}")
+            else:
+                logger.warning(f"Subject hint '{subject_hint}' not found in mapping")
+        else:
+            preferred_subject = detect_subject_preference(normalized_query) if not subject else None
 
         # If we found a specific course code, try exact match first
         exact_matches = []

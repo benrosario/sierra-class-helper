@@ -118,7 +118,7 @@ class SierraClassHelper(commands.Cog):
     @app_commands.describe(question="Your question about Sierra College courses")
     async def ask_command(self, interaction: discord.Interaction, question: str):
         """Ask Sierra Class Helper a question about courses"""
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
         try:
             logger.info(f"Question from {interaction.user}: {question}")
@@ -130,13 +130,13 @@ class SierraClassHelper(commands.Cog):
             response_text = result["response"]
 
             if len(response_text) <= 2000:
-                await interaction.followup.send(response_text)
+                await interaction.followup.send(response_text, ephemeral=True)
             else:
                 # Split into chunks
                 chunks = [response_text[i:i+2000] for i in range(0, len(response_text), 2000)]
-                await interaction.followup.send(chunks[0])
+                await interaction.followup.send(chunks[0], ephemeral=True)
                 for chunk in chunks[1:]:
-                    await interaction.channel.send(chunk)
+                    await interaction.followup.send(chunk, ephemeral=True)
 
             logger.info(f"Response sent to {interaction.user}")
 
@@ -144,7 +144,8 @@ class SierraClassHelper(commands.Cog):
             logger.error(f"Error processing question: {e}")
             await interaction.followup.send(
                 "Sorry, I encountered an error processing your question. "
-                "Please try again later or contact support."
+                "Please try again later or contact support.",
+                ephemeral=True
             )
 
     @app_commands.command(name="clear", description="Clear your conversation history with the bot")
@@ -160,7 +161,7 @@ class SierraClassHelper(commands.Cog):
     @app_commands.describe(query="Search query for courses")
     async def search_command(self, interaction: discord.Interaction, query: str):
         """Search for courses (returns raw data without AI formatting)"""
-        await interaction.response.defer(thinking=True)
+        await interaction.response.defer(thinking=True, ephemeral=True)
 
         try:
             logger.info(f"Search from {interaction.user}: {query}")
@@ -174,7 +175,7 @@ class SierraClassHelper(commands.Cog):
                     courses = result["courses"]
 
                     if not courses:
-                        await interaction.followup.send("No courses found matching your search.")
+                        await interaction.followup.send("No courses found matching your search.", ephemeral=True)
                         return
 
                     # Format courses nicely
@@ -192,17 +193,18 @@ class SierraClassHelper(commands.Cog):
                         output += f"CRN: {crn} | Instructor: {instructor}\n\n"
 
                     if len(output) <= 2000:
-                        await interaction.followup.send(output)
+                        await interaction.followup.send(output, ephemeral=True)
                     else:
-                        await interaction.followup.send(output[:2000])
+                        await interaction.followup.send(output[:2000], ephemeral=True)
                 else:
-                    await interaction.followup.send("Failed to search courses. Please try again.")
+                    await interaction.followup.send("Failed to search courses. Please try again.", ephemeral=True)
 
         except Exception as e:
             logger.error(f"Error processing search: {e}")
             await interaction.followup.send(
                 "Sorry, I encountered an error processing your search. "
-                "Please try again later."
+                "Please try again later.",
+                ephemeral=True
             )
 
 @bot.event

@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
 import os
+import json
 from datetime import datetime
 from openai import OpenAI
 from src.embeddings.core import search_courses, course_to_text
@@ -65,6 +66,208 @@ def get_data_last_updated():
         return datetime.fromtimestamp(data_timestamp).strftime('%B %d, %Y at %I:%M %p')
     return None
 
+def detect_language(text: str, conversation_history: list = None) -> tuple[str, str]:
+    """
+    Detect the language of the input text.
+
+    Args:
+        text: The user's current message
+        conversation_history: Optional list of previous conversation messages to establish context
+
+    Returns:
+        tuple: (language_code, language_name)
+        e.g., ('en', 'English'), ('es', 'Spanish'), ('uk', 'Ukrainian')
+    """
+    # Language code to name mapping
+    language_names = {
+        'en': 'English',
+        'es': 'Spanish',
+        'fr': 'French',
+        'de': 'German',
+        'it': 'Italian',
+        'pt': 'Portuguese',
+        'ru': 'Russian',
+        'uk': 'Ukrainian',
+        'zh-cn': 'Chinese (Simplified)',
+        'zh-tw': 'Chinese (Traditional)',
+        'ja': 'Japanese',
+        'ko': 'Korean',
+        'ar': 'Arabic',
+        'hi': 'Hindi',
+        'vi': 'Vietnamese',
+        'th': 'Thai',
+        'pl': 'Polish',
+        'nl': 'Dutch',
+        'tr': 'Turkish',
+        'sv': 'Swedish',
+        'da': 'Danish',
+        'no': 'Norwegian',
+        'fi': 'Finnish',
+        'cs': 'Czech',
+        'ro': 'Romanian',
+        'el': 'Greek',
+        'he': 'Hebrew',
+        'id': 'Indonesian',
+        'ms': 'Malay',
+        'tl': 'Tagalog',
+    }
+
+    # Always use LLM for language detection on every query
+    # This allows users to switch languages mid-conversation and handles all edge cases
+    detection_prompt = f"""What language is this text written in?
+Text: "{text}"
+
+Reply with ONLY the language name from this list: English, Spanish, French, German, Italian, Portuguese, Russian, Ukrainian, Chinese, Japanese, Korean, Arabic, Hindi, Vietnamese, Thai, Polish, Dutch, Turkish, Swedish, Danish, Norwegian, Finnish, Czech, Romanian, Greek, Hebrew, Indonesian, Malay, Tagalog.
+
+If the text appears to be English with technical terms or abbreviations, reply with "English"."""
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a language detection expert. Reply with only the language name."},
+                {"role": "user", "content": detection_prompt}
+            ],
+            temperature=0,
+            max_tokens=10
+        )
+
+        detected_lang_name = response.choices[0].message.content.strip()
+
+        # Map language name back to code
+        name_to_code = {v: k for k, v in language_names.items()}
+        llm_lang_code = name_to_code.get(detected_lang_name, 'en')
+
+        logger.info(f"LLM language detection: '{text}' -> {detected_lang_name} ({llm_lang_code})")
+
+        lang_name = language_names.get(llm_lang_code, detected_lang_name)
+        return (llm_lang_code, lang_name)
+    except Exception as e:
+        logger.error(f"Failed to detect language with LLM: {e}")
+        # On error, default to English
+        return ('en', 'English')
+
+def extract_user_intent(query: str) -> dict:
+    """
+    Extract structured intent from user query using LLM.
+
+    Returns a dictionary with:
+    - subject_area: Academic subject (e.g., "Computer Science", "Math")
+    - keywords_required: List of terms that must appear in course descriptions
+    - keywords_exclude: List of terms that disqualify courses
+    - intent_summary: Human-readable description of intent
+    """
+    try:
+        prompt = """Extract the academic intent from this course search query. Return ONLY valid JSON (no markdown, no code blocks).
+
+Return JSON in this exact format:
+{
+  "subject_area": "Computer Science" or "Math" or "English" or null if unclear,
+  "keywords_required": ["keyword1", "keyword2"],
+  "keywords_exclude": ["keyword1", "keyword2"],
+  "intent_summary": "Brief description of what the user wants",
+  "is_specific_course_title": true or false
+}
+
+CRITICAL GUIDELINES:
+- If the query mentions a specific course title (e.g., "History of Rock and Roll", "Introduction to Psychology", "Creative Writing"), set is_specific_course_title: true
+- For specific course titles, extract keywords from the FULL course title, not just individual words
+- For example, "History of Rock and Roll" should require ["rock", "roll", "music"] NOT ["history"] because it's a music course
+- keywords_required: Terms that MUST appear in relevant courses
+- keywords_exclude: Terms that indicate WRONG courses
+- Be generous with required keywords (synonyms and related terms)
+- Only exclude terms that are clearly opposite to intent
+
+Examples:
+Query: "what coding class is best for designers"
+{"subject_area": "Computer Science", "keywords_required": ["programming", "coding", "computer science", "software", "web programming"], "keywords_exclude": ["graphic design", "art", "illustration", "visual design"], "intent_summary": "Programming courses suitable for design students", "is_specific_course_title": false}
+
+Query: "History of Rock and Roll classes"
+{"subject_area": "Music", "keywords_required": ["rock", "roll", "music"], "keywords_exclude": ["u.s.", "american", "world history", "european"], "intent_summary": "Music course about rock and roll history", "is_specific_course_title": true}
+
+Query: "easy math class"
+{"subject_area": "Math", "keywords_required": ["math", "mathematics", "algebra", "statistics"], "keywords_exclude": ["calculus", "advanced", "honors"], "intent_summary": "Introductory or easier mathematics courses", "is_specific_course_title": false}
+
+Query: "Introduction to Psychology"
+{"subject_area": "Psychology", "keywords_required": ["psychology", "psych", "intro"], "keywords_exclude": [], "intent_summary": "Introductory psychology course", "is_specific_course_title": true}
+
+Now extract intent from this query:"""
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": query}
+            ],
+            temperature=0,
+            max_tokens=200
+        )
+
+        intent_json = response.choices[0].message.content.strip()
+
+        # Remove markdown code blocks if present
+        if intent_json.startswith("```"):
+            intent_json = intent_json.split("```")[1]
+            if intent_json.startswith("json"):
+                intent_json = intent_json[4:]
+            intent_json = intent_json.strip()
+
+        intent = json.loads(intent_json)
+        logger.info(f"Extracted intent: {intent}")
+        return intent
+    except Exception as e:
+        logger.error(f"Failed to extract intent: {e}")
+        # Return default intent on failure
+        return {
+            "subject_area": None,
+            "keywords_required": [],
+            "keywords_exclude": [],
+            "is_specific_course_title": False,
+            "intent_summary": "General course search"
+        }
+
+def validate_course_relevance(course: dict, intent: dict) -> bool:
+    """
+    Validate if a course matches the user's intent using LLM.
+
+    Returns True if relevant, False otherwise.
+    """
+    try:
+        # Quick check: if no intent requirements, accept all courses
+        if not intent.get("keywords_required") and not intent.get("intent_summary"):
+            return True
+
+        # Build course summary for validation
+        course_summary = f"{course.get('subjectDescription', '')} {course.get('subject', '')}{course.get('courseNumber', '')} - {course.get('courseTitle', '')}"
+
+        prompt = f"""Does this course match the user's intent?
+
+Intent: {intent.get('intent_summary', 'General course search')}
+
+Course: {course_summary}
+
+Reply with ONLY 'YES' or 'NO'."""
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a course relevance validator. Reply with only YES or NO."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+            max_tokens=5
+        )
+
+        answer = response.choices[0].message.content.strip().upper()
+        is_relevant = answer == "YES"
+
+        logger.info(f"Course validation: {course_summary[:50]}... -> {answer}")
+        return is_relevant
+    except Exception as e:
+        logger.error(f"Failed to validate course relevance: {e}")
+        # On error, accept the course (fail open)
+        return True
+
 # System prompts for the chatbot
 def get_system_prompts():
     prompts = [
@@ -74,6 +277,7 @@ def get_system_prompts():
         "You are helping students from the California Community College 'Sierra College'. Their website is https://sierracollege.edu.",
         "Sierra College has TWO active campuses: Rocklin Campus (main campus) and Nevada County Campus (Grass Valley/Tahoe-Truckee area). NOTE: The Roseville Campus is CLOSED and no longer offers courses. When students ask about campus location, clearly state which campus each course is at.",
         "You can advise students on any academic matter, grabbing information from the Sierra College website.",
+        "IMPORTANT: ALWAYS copy the language of the user. Example: If a user speaks to you in Ukrainian, respond in Ukrainian.",
         "IMPORTANT: When listing courses, ALWAYS show the full course name (e.g., 'College Algebra (MATH0012)') at the start of each course listing.",
         "IMPORTANT: ALWAYS include the CRN (Course Reference Number) for EVERY course you list. The CRN is critical information that students need to register. Example format: 'CRN: 12345' or include it prominently in the course listing.",
         "IMPORTANT: ALWAYS include the instructor's name for EVERY course you list. If multiple instructors, list all of them. If no instructor is assigned, clearly state 'Instructor: TBA' or 'No instructor assigned'.",
@@ -242,8 +446,12 @@ Ask me about any courses at Sierra College!"""
                 for msg in request.conversation_history[-10:]:  # Limit to last 10 messages
                     messages.append({"role": msg.role, "content": msg.content})
 
-            # Add current message
-            messages.append({"role": "user", "content": request.message})
+            # Detect language and add current message with explicit language instruction
+            lang_code, lang_name = detect_language(request.message, request.conversation_history)
+            messages.append({
+                "role": "user",
+                "content": f"{request.message}\n\nIMPORTANT: Respond in {lang_name}."
+            })
 
             completion = openai_client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -289,7 +497,123 @@ Ask me about any courses at Sierra College!"""
             else:
                 logger.info(f"New topic detected, using query without context: {search_query}")
 
-        results = search_courses(search_query, k=request.num_courses)
+        # Extract user intent for intelligent filtering
+        intent = extract_user_intent(search_query)
+        logger.info(f"User intent: {intent['intent_summary']}")
+
+        # Search for MORE candidates (30 instead of 3) to allow filtering
+        # Pass subject area hint from intent to improve search accuracy
+        subject_hint = intent.get("subject_area")
+        candidate_results = search_courses(search_query, k=30, subject_hint=subject_hint)
+
+        # Filter candidates using keywords from intent
+        filtered_results = []
+        keywords_required = [kw.lower() for kw in intent.get("keywords_required", [])]
+        keywords_exclude = [kw.lower() for kw in intent.get("keywords_exclude", [])]
+
+        for course in candidate_results:
+            # Convert course to text for keyword matching
+            course_text = course_to_text(course).lower()
+
+            # Check if course has required keywords (if any specified)
+            if keywords_required:
+                has_required = any(keyword in course_text for keyword in keywords_required)
+            else:
+                has_required = True  # No requirements, accept all
+
+            # Check if course has excluded keywords
+            has_excluded = any(keyword in course_text for keyword in keywords_exclude)
+
+            # Accept course if it has required keywords and no excluded keywords
+            if has_required and not has_excluded:
+                filtered_results.append(course)
+
+                # Stop once we have enough candidates for validation
+                if len(filtered_results) >= 10:
+                    break
+
+        logger.info(f"Filtered {len(candidate_results)} candidates down to {len(filtered_results)} using keywords")
+
+        # If no results after keyword filtering, fallback to original candidates
+        if not filtered_results:
+            logger.warning("No results after keyword filtering, using original candidates")
+            filtered_results = candidate_results[:10]
+
+        # Validate filtered results using LLM (only validate top candidates to save cost)
+        validated_results = []
+        for course in filtered_results[:6]:  # Validate top 6 to get final 3
+            if validate_course_relevance(course, intent):
+                validated_results.append(course)
+
+            # Stop once we have enough results
+            if len(validated_results) >= request.num_courses:
+                break
+
+        # If validation rejected all courses, retry search without subject hint
+        # This handles cases where LLM picked wrong subject (e.g., "Engineering" instead of "Mechatronics")
+        if not validated_results and subject_hint:
+            logger.warning(f"All courses rejected by validation. Subject hint '{subject_hint}' may be incorrect.")
+            logger.info("Retrying search without subject hint...")
+
+            # Retry search without subject bias
+            retry_candidates = search_courses(search_query, k=30, subject_hint=None)
+
+            # Filter retry candidates with keywords
+            retry_filtered = []
+            for course in retry_candidates:
+                course_text = course_to_text(course).lower()
+                has_required = any(keyword in course_text for keyword in keywords_required) if keywords_required else True
+                has_excluded = any(keyword in course_text for keyword in keywords_exclude)
+
+                if has_required and not has_excluded:
+                    retry_filtered.append(course)
+                    if len(retry_filtered) >= 10:
+                        break
+
+            # Validate retry results
+            for course in retry_filtered[:6]:
+                if validate_course_relevance(course, intent):
+                    validated_results.append(course)
+                if len(validated_results) >= request.num_courses:
+                    break
+
+            if validated_results:
+                logger.info(f"Retry successful: Found {len(validated_results)} courses without subject hint")
+
+        # Use validated results
+        results = validated_results if validated_results else []
+
+        logger.info(f"Final results after validation: {len(results)} courses")
+
+        # If still no results after retry, inform user
+        if not results:
+            logger.warning("No courses found matching user intent after validation and retry")
+            # Don't show rejected courses - instead inform user nothing matches
+            lang_code, lang_name = detect_language(request.message, request.conversation_history)
+
+            messages = [
+                {"role": "system", "content": prompt}
+                for prompt in get_system_prompts()
+            ]
+
+            if request.conversation_history:
+                for msg in request.conversation_history[-10:]:
+                    messages.append({"role": msg.role, "content": msg.content})
+
+            messages.append({
+                "role": "user",
+                "content": f"User query (in {lang_name}): {request.message}\n\nNo courses were found matching this query. The search looked for courses related to '{intent.get('intent_summary', request.message)}' but could not find any matches.\n\nIMPORTANT: Respond in {lang_name}. Politely inform the user that no courses match their specific query, and suggest they try different search terms or ask about related subjects."
+            })
+
+            completion = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages
+            )
+
+            return ChatResponse(
+                response=completion.choices[0].message.content,
+                courses_searched=0
+            )
 
         # Build context from search results
         context = "\n".join(course_to_text(r) for r in results)
@@ -305,10 +629,13 @@ Ask me about any courses at Sierra College!"""
             for msg in request.conversation_history[-10:]:  # Limit to last 10 messages
                 messages.append({"role": msg.role, "content": msg.content})
 
-        # Add current query with course context
+        # Detect the language of the user's query (using conversation history for context)
+        lang_code, lang_name = detect_language(request.message, request.conversation_history)
+
+        # Add current query with course context and explicit language instruction
         messages.append({
             "role": "user",
-            "content": f"User query: {request.message}\n\nHere are the top {len(results)} matching courses from the search:\n{context}\n\nPlease present these {len(results)} courses to the user, or respond to their question if they're not asking about specific courses."
+            "content": f"User query (in {lang_name}): {request.message}\n\nHere are the top {len(results)} matching courses from the search:\n{context}\n\nIMPORTANT: Respond in {lang_name}. Present these {len(results)} courses to the user, or respond to their question if they're not asking about specific courses."
         })
 
         completion = openai_client.chat.completions.create(

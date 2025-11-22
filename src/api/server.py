@@ -147,6 +147,76 @@ If the text appears to be English with technical terms or abbreviations, reply w
         # On error, default to English
         return ('en', 'English')
 
+def detect_topic_continuation(current_message: str, conversation_history: list) -> bool:
+    """
+    Intelligently detect if the current message is a continuation of the previous topic
+    or if it's a new, unrelated question.
+
+    Args:
+        current_message: The user's current message
+        conversation_history: List of previous conversation messages
+
+    Returns:
+        bool: True if same topic (use context), False if new topic (ignore context)
+    """
+    if not conversation_history or len(conversation_history) == 0:
+        return False
+
+    # Get the last few user messages for context
+    recent_user_messages = [
+        msg.content for msg in conversation_history[-3:]
+        if msg.role == "user"
+    ]
+
+    if not recent_user_messages:
+        return False
+
+    # Combine recent messages
+    previous_context = " | ".join(recent_user_messages)
+
+    try:
+        prompt = f"""Determine if the new message is a continuation of the previous conversation topic or a completely new topic.
+
+Previous conversation:
+{previous_context}
+
+New message:
+{current_message}
+
+Respond with ONLY "SAME" if the new message is asking about the same general topic/subject area as the previous conversation (e.g., follow-up questions, asking about different semesters of the same subject, clarifying questions).
+
+Respond with ONLY "NEW" if the new message is asking about a completely different topic/subject area (e.g., switching from Computer Science to English, or from Math to Music).
+
+Examples:
+- Previous: "What CS classes are available?" | New: "Which one teaches algorithms?" → SAME
+- Previous: "Show me math classes" | New: "What about in summer?" → SAME
+- Previous: "Computer science classes in fall" | New: "When does it meet?" → SAME
+- Previous: "What programming classes can I take?" | New: "English 1B in spring" → NEW
+- Previous: "Show me biology courses" | New: "What about chemistry classes?" → NEW
+
+Your response (SAME or NEW):"""
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are an expert at detecting conversation topic changes. Reply with only SAME or NEW."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+            max_tokens=5
+        )
+
+        result = response.choices[0].message.content.strip().upper()
+        is_same_topic = result == "SAME"
+
+        logger.info(f"Topic detection: Previous=[{previous_context[:50]}...] | Current=[{current_message}] → {result} (same_topic={is_same_topic})")
+        return is_same_topic
+
+    except Exception as e:
+        logger.error(f"Failed to detect topic continuation: {e}")
+        # On error, default to treating as new topic to avoid contamination
+        return False
+
 def extract_user_intent(query: str) -> dict:
     """
     Extract structured intent from user query using LLM.
@@ -471,31 +541,23 @@ Ask me about any courses at Sierra College!"""
 
         # Only use conversation context if the query seems like a follow-up (not a new topic)
         if request.conversation_history and len(request.conversation_history) > 0:
-            # Detect if this is a follow-up question (starts with "what about", "how about", "and", etc.)
-            follow_up_indicators = [
-                "what about", "how about", "and what", "what if", "or what",
-                "in summer", "in fall", "in winter", "in spring",
-                "for summer", "for fall", "for winter", "for spring",
-                "and summer", "and fall", "and winter", "and spring",
-            ]
+            # Use GPT to intelligently detect if this is a continuation of the previous topic
+            is_same_topic = detect_topic_continuation(
+                request.message,
+                request.conversation_history
+            )
 
-            query_lower = request.message.lower()
-            is_follow_up = any(indicator in query_lower for indicator in follow_up_indicators)
-
-            # Also check if query is very short (likely incomplete without context)
-            is_short_query = len(request.message.split()) <= 4
-
-            # Only add context if this seems like a follow-up or incomplete query
-            if is_follow_up or is_short_query:
+            # Only add context if this is truly a follow-up on the same topic
+            if is_same_topic:
                 # Get last few messages for context (helps with "what about summer?" queries)
                 recent_context = " ".join([
                     msg.content for msg in request.conversation_history[-3:]
                     if msg.role == "user"
                 ])
                 search_query = f"{recent_context} {request.message}"
-                logger.info(f"Follow-up detected, enhanced search query with context: {search_query}")
+                logger.info(f"Same topic continuation detected, enhanced search query with context: {search_query}")
             else:
-                logger.info(f"New topic detected, using query without context: {search_query}")
+                logger.info(f"New topic detected, using query without previous context: {search_query}")
 
         # Extract user intent for intelligent filtering
         intent = extract_user_intent(search_query)

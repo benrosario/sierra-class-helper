@@ -18,11 +18,6 @@ __pycache__/
 .AppleDouble
 .LSOverride
 
-# Generated data files
-courses.index
-id_to_course.json
-course_hashes*.json
-
 # IDE
 .vscode/
 .idea/

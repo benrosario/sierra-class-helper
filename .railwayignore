@@ -1,0 +1,61 @@
+# Railway Ignore File
+# Exclude files from Railway deployment to reduce build time and size
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment files (set via Railway dashboard)
+.env
+.env.local
+
+# Git
+.git/
+.gitignore
+
+# Documentation (optional - uncomment to exclude)
+# docs/
+
+# Local development
+start_local.sh
+update_courses.sh
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+
+# IMPORTANT: DO NOT IGNORE THESE - REQUIRED FOR DEPLOYMENT
+# courses.index
+# id_to_course.json
+# course_data/
+# requirements.txt
+# api_server.py
+# discord_bot.py
+# src/

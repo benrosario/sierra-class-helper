@@ -1,0 +1,41 @@
+# Railway Configuration for Sierra Class Helper
+# This file defines two services: API and Discord Bot
+
+[build]
+builder = "NIXPACKS"
+
+# API Server Service
+[[services]]
+name = "api"
+source = "."
+
+[services.buildCommand]
+command = "pip install -r requirements.txt"
+
+[services.startCommand]
+command = "python api_server.py"
+
+[services.healthcheck]
+path = "/health"
+interval = 30
+timeout = 10
+
+[services.env]
+PORT = "8000"
+ENVIRONMENT = "production"
+
+# Discord Bot Service
+[[services]]
+name = "bot"
+source = "."
+
+[services.buildCommand]
+command = "pip install -r requirements.txt"
+
+[services.startCommand]
+command = "python discord_bot.py"
+
+[services.env]
+# API_URL will be automatically set to the Railway internal URL of the API service
+# Format: https://api.railway.internal:8000
+API_URL = "${{api.RAILWAY_PRIVATE_DOMAIN}}"

@@ -39,3 +39,24 @@ command = "python discord_bot.py"
 # API_URL will be automatically set to the Railway internal URL of the API service
 # Format: https://api.railway.internal:8000
 API_URL = "${{api.RAILWAY_PRIVATE_DOMAIN}}"
+
+# Course Update Cron Job
+# Runs hourly from 8am-8pm PST to keep course data fresh
+[[services]]
+name = "course-updater"
+source = "."
+
+[services.buildCommand]
+command = "pip install -r requirements.txt && playwright install chromium"
+
+[services.startCommand]
+command = "python update_courses.py"
+
+[services.cron]
+# Run every hour from 8am to 8pm Pacific Time
+# Cron format: minute hour day month day-of-week
+schedule = "0 8-20 * * *"
+timezone = "America/Los_Angeles"
+
+[services.env]
+ENVIRONMENT = "production"

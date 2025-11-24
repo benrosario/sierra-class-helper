@@ -53,10 +53,10 @@ command = "pip install -r requirements.txt && playwright install chromium"
 command = "python update_courses.py"
 
 [services.cron]
-# Run every hour from 8am to 8pm Pacific Time
-# Cron format: minute hour day month day-of-week
-schedule = "0 8-20 * * *"
-timezone = "America/Los_Angeles"
+# Run every hour from 8am to 8pm Pacific Daylight Time (PDT)
+# In UTC: 3pm-11pm + midnight-3am = 15-23,0-3
+# Note: During PST (winter), this runs 9am-9pm instead of 8am-8pm
+schedule = "0 15-23,0-3 * * *"
 
 [services.env]
 ENVIRONMENT = "production"

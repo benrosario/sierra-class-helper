@@ -9,8 +9,8 @@ import logging
 import hashlib
 from pathlib import Path
 from datetime import datetime
+from src.utils.course_loader import load_all_semesters
 from src.embeddings.incremental import (
-    load_all_semesters,
     compute_course_hash,
     load_course_hashes,
     save_course_hashes,

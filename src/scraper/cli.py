@@ -1,4 +1,4 @@
-from scraper import sierra_scrape
+from src.scraper.scraper import sierra_scrape
 
 TERM_MAP = {
     #"spring2025": "#select2-result-label-5",

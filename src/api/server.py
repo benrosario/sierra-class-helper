@@ -454,24 +454,19 @@ Respond with ONLY "TRUE" or "FALSE"."""
         # Default to treating as course-related to maintain backward compatibility
         return True
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+def _handle_non_course_question(request: ChatRequest) -> ChatResponse:
     """
-    Chat endpoint that searches courses and generates AI response
+    Handle general/identity questions without course search.
 
-    Uses RAG to provide context-aware responses
+    Args:
+        request: The chat request containing user message and history
+
+    Returns:
+        ChatResponse with identity/general information and 0 courses searched
     """
-    try:
-        logger.info(f"Chat request: {request.message}")
+    logger.info("Non-course question detected, responding without course search")
 
-        # Check if this is a course-related question
-        is_course_question = is_course_related_question(request.message)
-
-        if not is_course_question:
-            # Handle non-course questions without searching courses
-            logger.info("Non-course question detected, responding without course search")
-
-            identity_prompt = """You are Sierra Class Helper, an AI academic advisor created by Sierra College student Ben Rosario.
+    identity_prompt = """You are Sierra Class Helper, an AI academic advisor created by Sierra College student Ben Rosario.
 
 **Your Purpose:**
 I help students at Sierra College (a California Community College) find and explore courses across our two active campuses:
@@ -507,57 +502,243 @@ Course data is updated regularly from Sierra College's course catalog. Check the
 
 Ask me about any courses at Sierra College!"""
 
-            messages = [
-                {"role": "system", "content": identity_prompt}
-            ]
+    messages = [
+        {"role": "system", "content": identity_prompt}
+    ]
 
-            # Add conversation history if provided
-            if request.conversation_history:
-                for msg in request.conversation_history[-10:]:  # Limit to last 10 messages
-                    messages.append({"role": msg.role, "content": msg.content})
+    # Add conversation history if provided
+    if request.conversation_history:
+        for msg in request.conversation_history[-10:]:  # Limit to last 10 messages
+            messages.append({"role": msg.role, "content": msg.content})
 
-            # Detect language and add current message with explicit language instruction
-            lang_code, lang_name = detect_language(request.message, request.conversation_history)
-            messages.append({
-                "role": "user",
-                "content": f"{request.message}\n\nIMPORTANT: Respond in {lang_name}."
-            })
+    # Detect language and add current message with explicit language instruction
+    lang_code, lang_name = detect_language(request.message, request.conversation_history)
+    messages.append({
+        "role": "user",
+        "content": f"{request.message}\n\nIMPORTANT: Respond in {lang_name}."
+    })
 
-            completion = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages
-            )
+    completion = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages
+    )
 
-            response_text = completion.choices[0].message.content
+    response_text = completion.choices[0].message.content
 
-            return ChatResponse(
-                response=response_text,
-                courses_searched=0
-            )
+    return ChatResponse(
+        response=response_text,
+        courses_searched=0
+    )
+
+
+def _build_search_query(request: ChatRequest) -> str:
+    """
+    Build enhanced search query with conversation context if needed.
+
+    Intelligently detects if the current message is a follow-up to previous
+    conversation and adds context accordingly.
+
+    Args:
+        request: The chat request with message and conversation history
+
+    Returns:
+        str: Enhanced search query (with or without context)
+    """
+    search_query = request.message
+
+    # Only use conversation context if the query seems like a follow-up (not a new topic)
+    if request.conversation_history and len(request.conversation_history) > 0:
+        # Use GPT to intelligently detect if this is a continuation of the previous topic
+        is_same_topic = detect_topic_continuation(
+            request.message,
+            request.conversation_history
+        )
+
+        # Only add context if this is truly a follow-up on the same topic
+        if is_same_topic:
+            # Get last few messages for context (helps with "what about summer?" queries)
+            recent_context = " ".join([
+                msg.content for msg in request.conversation_history[-3:]
+                if msg.role == "user"
+            ])
+            search_query = f"{recent_context} {request.message}"
+            logger.info(f"Same topic continuation detected, enhanced search query with context: {search_query}")
+        else:
+            logger.info(f"New topic detected, using query without previous context: {search_query}")
+
+    return search_query
+
+
+def _filter_and_validate_courses(candidate_results: list[dict], intent: dict, num_courses: int) -> list[dict]:
+    """
+    Apply keyword filtering and LLM validation to course candidates.
+
+    First filters candidates using required/excluded keywords from intent,
+    then validates top candidates using LLM to ensure relevance.
+
+    Args:
+        candidate_results: List of candidate courses from semantic search
+        intent: Extracted user intent with keywords and subject area
+        num_courses: Number of courses requested
+
+    Returns:
+        list[dict]: Validated courses that match user intent
+    """
+    # Filter candidates using keywords from intent
+    filtered_results = []
+    keywords_required = [kw.lower() for kw in intent.get("keywords_required", [])]
+    keywords_exclude = [kw.lower() for kw in intent.get("keywords_exclude", [])]
+
+    for course in candidate_results:
+        # Convert course to text for keyword matching
+        course_text = course_to_text(course).lower()
+
+        # Check if course has required keywords (if any specified)
+        if keywords_required:
+            has_required = any(keyword in course_text for keyword in keywords_required)
+        else:
+            has_required = True  # No requirements, accept all
+
+        # Check if course has excluded keywords
+        has_excluded = any(keyword in course_text for keyword in keywords_exclude)
+
+        # Accept course if it has required keywords and no excluded keywords
+        if has_required and not has_excluded:
+            filtered_results.append(course)
+
+            # Stop once we have enough candidates for validation
+            if len(filtered_results) >= 10:
+                break
+
+    logger.info(f"Filtered {len(candidate_results)} candidates down to {len(filtered_results)} using keywords")
+
+    # If no results after keyword filtering, fallback to original candidates
+    if not filtered_results:
+        logger.warning("No results after keyword filtering, using original candidates")
+        filtered_results = candidate_results[:10]
+
+    # Validate filtered results using LLM (only validate top candidates to save cost)
+    validated_results = []
+    for course in filtered_results[:6]:  # Validate top 6 to get final 3
+        if validate_course_relevance(course, intent):
+            validated_results.append(course)
+
+        # Stop once we have enough results
+        if len(validated_results) >= num_courses:
+            break
+
+    return validated_results
+
+
+def _handle_no_results(request: ChatRequest, intent: dict) -> ChatResponse:
+    """
+    Generate response when no courses match the query.
+
+    Args:
+        request: The chat request with user message and history
+        intent: Extracted user intent for explaining what was searched
+
+    Returns:
+        ChatResponse informing user no matches were found
+    """
+    logger.warning("No courses found matching user intent after validation and retry")
+
+    # Don't show rejected courses - instead inform user nothing matches
+    lang_code, lang_name = detect_language(request.message, request.conversation_history)
+
+    messages = [
+        {"role": "system", "content": prompt}
+        for prompt in get_system_prompts()
+    ]
+
+    if request.conversation_history:
+        for msg in request.conversation_history[-10:]:
+            messages.append({"role": msg.role, "content": msg.content})
+
+    messages.append({
+        "role": "user",
+        "content": f"User query (in {lang_name}): {request.message}\n\nNo courses were found matching this query. The search looked for courses related to '{intent.get('intent_summary', request.message)}' but could not find any matches.\n\nIMPORTANT: Respond in {lang_name}. Politely inform the user that no courses match their specific query, and suggest they try different search terms or ask about related subjects."
+    })
+
+    completion = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages
+    )
+
+    return ChatResponse(
+        response=completion.choices[0].message.content,
+        courses_searched=0
+    )
+
+
+def _generate_course_response(request: ChatRequest, results: list[dict]) -> ChatResponse:
+    """
+    Generate final LLM response with course data.
+
+    Args:
+        request: The chat request with user message and history
+        results: List of validated course results to include
+
+    Returns:
+        ChatResponse with generated answer and course count
+    """
+    # Build context from search results
+    context = "\n".join(course_to_text(r) for r in results)
+
+    # Generate response using OpenAI
+    messages = [
+        {"role": "system", "content": prompt}
+        for prompt in get_system_prompts()
+    ]
+
+    # Add conversation history if provided
+    if request.conversation_history:
+        for msg in request.conversation_history[-10:]:  # Limit to last 10 messages
+            messages.append({"role": msg.role, "content": msg.content})
+
+    # Detect the language of the user's query (using conversation history for context)
+    lang_code, lang_name = detect_language(request.message, request.conversation_history)
+
+    # Add current query with course context and explicit language instruction
+    messages.append({
+        "role": "user",
+        "content": f"User query (in {lang_name}): {request.message}\n\nHere are the top {len(results)} matching courses from the search:\n{context}\n\nIMPORTANT: Respond in {lang_name}. Present these {len(results)} courses to the user, or respond to their question if they're not asking about specific courses."
+    })
+
+    completion = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages
+    )
+
+    response_text = completion.choices[0].message.content
+
+    logger.info(f"Generated response for: {request.message}")
+
+    return ChatResponse(
+        response=response_text,
+        courses_searched=len(results)
+    )
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    """
+    Chat endpoint that searches courses and generates AI response
+
+    Uses RAG to provide context-aware responses
+    """
+    try:
+        logger.info(f"Chat request: {request.message}")
+
+        # Check if this is a course-related question
+        is_course_question = is_course_related_question(request.message)
+
+        if not is_course_question:
+            return _handle_non_course_question(request)
 
         # For course-related questions, proceed with normal RAG pipeline
-        # Search for relevant courses using current message + context from history
-        search_query = request.message
-
-        # Only use conversation context if the query seems like a follow-up (not a new topic)
-        if request.conversation_history and len(request.conversation_history) > 0:
-            # Use GPT to intelligently detect if this is a continuation of the previous topic
-            is_same_topic = detect_topic_continuation(
-                request.message,
-                request.conversation_history
-            )
-
-            # Only add context if this is truly a follow-up on the same topic
-            if is_same_topic:
-                # Get last few messages for context (helps with "what about summer?" queries)
-                recent_context = " ".join([
-                    msg.content for msg in request.conversation_history[-3:]
-                    if msg.role == "user"
-                ])
-                search_query = f"{recent_context} {request.message}"
-                logger.info(f"Same topic continuation detected, enhanced search query with context: {search_query}")
-            else:
-                logger.info(f"New topic detected, using query without previous context: {search_query}")
+        # Build enhanced search query with conversation context
+        search_query = _build_search_query(request)
 
         # Extract user intent for intelligent filtering
         intent = extract_user_intent(search_query)
@@ -568,48 +749,8 @@ Ask me about any courses at Sierra College!"""
         subject_hint = intent.get("subject_area")
         candidate_results = search_courses(search_query, k=30, subject_hint=subject_hint)
 
-        # Filter candidates using keywords from intent
-        filtered_results = []
-        keywords_required = [kw.lower() for kw in intent.get("keywords_required", [])]
-        keywords_exclude = [kw.lower() for kw in intent.get("keywords_exclude", [])]
-
-        for course in candidate_results:
-            # Convert course to text for keyword matching
-            course_text = course_to_text(course).lower()
-
-            # Check if course has required keywords (if any specified)
-            if keywords_required:
-                has_required = any(keyword in course_text for keyword in keywords_required)
-            else:
-                has_required = True  # No requirements, accept all
-
-            # Check if course has excluded keywords
-            has_excluded = any(keyword in course_text for keyword in keywords_exclude)
-
-            # Accept course if it has required keywords and no excluded keywords
-            if has_required and not has_excluded:
-                filtered_results.append(course)
-
-                # Stop once we have enough candidates for validation
-                if len(filtered_results) >= 10:
-                    break
-
-        logger.info(f"Filtered {len(candidate_results)} candidates down to {len(filtered_results)} using keywords")
-
-        # If no results after keyword filtering, fallback to original candidates
-        if not filtered_results:
-            logger.warning("No results after keyword filtering, using original candidates")
-            filtered_results = candidate_results[:10]
-
-        # Validate filtered results using LLM (only validate top candidates to save cost)
-        validated_results = []
-        for course in filtered_results[:6]:  # Validate top 6 to get final 3
-            if validate_course_relevance(course, intent):
-                validated_results.append(course)
-
-            # Stop once we have enough results
-            if len(validated_results) >= request.num_courses:
-                break
+        # Filter and validate candidates
+        validated_results = _filter_and_validate_courses(candidate_results, intent, request.num_courses)
 
         # If validation rejected all courses, retry search without subject hint
         # This handles cases where LLM picked wrong subject (e.g., "Engineering" instead of "Mechatronics")
@@ -619,100 +760,21 @@ Ask me about any courses at Sierra College!"""
 
             # Retry search without subject bias
             retry_candidates = search_courses(search_query, k=30, subject_hint=None)
-
-            # Filter retry candidates with keywords
-            retry_filtered = []
-            for course in retry_candidates:
-                course_text = course_to_text(course).lower()
-                has_required = any(keyword in course_text for keyword in keywords_required) if keywords_required else True
-                has_excluded = any(keyword in course_text for keyword in keywords_exclude)
-
-                if has_required and not has_excluded:
-                    retry_filtered.append(course)
-                    if len(retry_filtered) >= 10:
-                        break
-
-            # Validate retry results
-            for course in retry_filtered[:6]:
-                if validate_course_relevance(course, intent):
-                    validated_results.append(course)
-                if len(validated_results) >= request.num_courses:
-                    break
+            validated_results = _filter_and_validate_courses(retry_candidates, intent, request.num_courses)
 
             if validated_results:
                 logger.info(f"Retry successful: Found {len(validated_results)} courses without subject hint")
 
         # Use validated results
         results = validated_results if validated_results else []
-
         logger.info(f"Final results after validation: {len(results)} courses")
 
         # If still no results after retry, inform user
         if not results:
-            logger.warning("No courses found matching user intent after validation and retry")
-            # Don't show rejected courses - instead inform user nothing matches
-            lang_code, lang_name = detect_language(request.message, request.conversation_history)
+            return _handle_no_results(request, intent)
 
-            messages = [
-                {"role": "system", "content": prompt}
-                for prompt in get_system_prompts()
-            ]
-
-            if request.conversation_history:
-                for msg in request.conversation_history[-10:]:
-                    messages.append({"role": msg.role, "content": msg.content})
-
-            messages.append({
-                "role": "user",
-                "content": f"User query (in {lang_name}): {request.message}\n\nNo courses were found matching this query. The search looked for courses related to '{intent.get('intent_summary', request.message)}' but could not find any matches.\n\nIMPORTANT: Respond in {lang_name}. Politely inform the user that no courses match their specific query, and suggest they try different search terms or ask about related subjects."
-            })
-
-            completion = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages
-            )
-
-            return ChatResponse(
-                response=completion.choices[0].message.content,
-                courses_searched=0
-            )
-
-        # Build context from search results
-        context = "\n".join(course_to_text(r) for r in results)
-
-        # Generate response using OpenAI
-        messages = [
-            {"role": "system", "content": prompt}
-            for prompt in get_system_prompts()
-        ]
-
-        # Add conversation history if provided
-        if request.conversation_history:
-            for msg in request.conversation_history[-10:]:  # Limit to last 10 messages
-                messages.append({"role": msg.role, "content": msg.content})
-
-        # Detect the language of the user's query (using conversation history for context)
-        lang_code, lang_name = detect_language(request.message, request.conversation_history)
-
-        # Add current query with course context and explicit language instruction
-        messages.append({
-            "role": "user",
-            "content": f"User query (in {lang_name}): {request.message}\n\nHere are the top {len(results)} matching courses from the search:\n{context}\n\nIMPORTANT: Respond in {lang_name}. Present these {len(results)} courses to the user, or respond to their question if they're not asking about specific courses."
-        })
-
-        completion = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages
-        )
-
-        response_text = completion.choices[0].message.content
-
-        logger.info(f"Generated response for: {request.message}")
-
-        return ChatResponse(
-            response=response_text,
-            courses_searched=len(results)
-        )
+        # Generate final response with course data
+        return _generate_course_response(request, results)
 
     except Exception as e:
         logger.error(f"Chat failed: {e}")

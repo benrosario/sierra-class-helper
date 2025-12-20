@@ -11,8 +11,20 @@ TERM_MAP = {
     "spring2026": "#select2-result-label-2"
 }
 
-# Remove irrelevant fields from course JSON
 def process_json(course):
+    """
+    Extract and format relevant fields from raw course API response.
+
+    Takes the full course JSON from Sierra College's API and extracts only
+    the fields needed for the chatbot, reformatted into a cleaner structure.
+
+    Args:
+        course: Raw course dictionary from the Sierra College API
+
+    Returns:
+        dict: Cleaned course data with only relevant fields (term, CRN, subject,
+              enrollment, faculty, meetings, etc.)
+    """
     return {
         "term": course.get("termDesc"),
         "CRN": course.get("courseReferenceNumber"),
@@ -62,6 +74,30 @@ def process_json(course):
 courses_processed = 0
 
 def sierra_scrape(term: str, debug: bool):
+    """
+    Scrape course data from Sierra College's course search page.
+
+    Uses Playwright to automate browser interaction with Sierra's course search
+    system, intercepts API responses, and collects all course data for the
+    specified term.
+
+    Args:
+        term: Semester to scrape (e.g., "fall2025", "spring2026")
+              Must be a key in TERM_MAP
+        debug: If True, runs browser in headed mode (visible) for debugging
+
+    Returns:
+        dict: Dictionary mapping CRN to course data
+              Format: {CRN: {"course": {...course data...}}}
+
+    Raises:
+        ValueError: If term is not found in TERM_MAP
+
+    Example:
+        >>> courses = sierra_scrape("fall2025", debug=False)
+        >>> print(len(courses))
+        1234
+    """
     
     print("Initializing...")
     

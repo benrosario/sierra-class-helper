@@ -15,6 +15,7 @@ from datetime import datetime
 # Import shared utilities
 from src.utils.course_formatting import informalName, meetingDays
 from src.utils.campus import get_campus
+from src.utils.course_loader import load_all_semesters
 from src.utils.embedding_helpers import (
     get_embeddings_batch as get_embeddings_batch_helper,
     get_embedding as get_embedding_helper,
@@ -35,22 +36,6 @@ dimension = 1536
 index_file = "courses.index"
 metadata_file = "id_to_course.json"
 hash_file = "course_hashes.json"  # Track which courses have changed
-
-def load_all_semesters(directory="course_data"):
-    """Load all course data from JSON files"""
-    all_courses = {}
-
-    for json_file in Path(directory).glob("*.json"):
-        with open(json_file, 'r') as f:
-            data = json.load(f)
-            term = json_file.stem
-
-            for crn, course_data in data.items():
-                if 'course' in course_data:
-                    course_data['course']['source_term'] = term
-                all_courses[crn] = course_data
-
-    return all_courses
 
 def compute_course_hash(course_data):
     """Compute a hash of course data to detect changes"""

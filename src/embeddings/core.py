@@ -10,6 +10,8 @@ from openai import OpenAI
 # Import shared utilities
 from src.utils.course_formatting import informalName, meetingDays
 from src.utils.campus import get_campus
+from src.utils.subject_mapping import SUBJECT_MAPPING
+from src.utils.course_loader import load_all_semesters
 from src.utils.embedding_helpers import (
     estimate_tokens,
     get_embeddings_batch as get_embeddings_batch_helper,
@@ -31,23 +33,7 @@ dimension = 1536
 index_file = "courses.index"
 metadata_file = "id_to_course.json"
 
-# Load course data for each semester
-def load_all_semesters(directory="course_data"):
-    all_courses = {}
-    
-    for json_file in Path(directory).glob("*.json"):
-        with open (json_file, 'r') as f:
-            data = json.load(f)
-            
-            term = json_file.stem
-            
-            for crn, course_data in data.items():
-                if 'course' in course_data:
-                    course_data['course']['source_term'] = term
-                all_courses[crn] = course_data
-                
-    return all_courses
-
+# Load all course data from all semesters
 courses = load_all_semesters()
 
 # Wrapper function to convert course to text using utility
@@ -63,12 +49,6 @@ def get_embedding(text: str) -> list[float]:
 def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
     """Get embeddings in batches using shared utility."""
     return get_embeddings_batch_helper(client, texts)
-
-# Format course start/end time
-def format_time(t):
-    if not t or len(t) < 3:  # handle None or malformed
-        return "N/A"
-    return f"{t[:-2]}:{t[-2:]}"  # split into hours:minutes
 
 # Check if index + metadata already exist
 if os.path.exists(index_file) and os.path.exists(metadata_file):
@@ -249,6 +229,98 @@ def detect_subject_preference(query: str) -> str | None:
 
     return None
 
+
+def _find_exact_course_matches(subject: str, course_number: str, id_to_course_list: list) -> list[dict]:
+    """
+    Find exact matches for a specific course code.
+
+    Args:
+        subject: Course subject code (e.g., "MATH", "CHEM")
+        course_number: Course number (e.g., "1A", "101")
+        id_to_course_list: List of all courses with metadata
+
+    Returns:
+        list[dict]: Courses that exactly match the subject and number
+    """
+    exact_matches = []
+    logger.info(f"Exact course code detected: {subject} {course_number}")
+
+    for entry in id_to_course_list:
+        course = entry["course"]
+        if (course.get("subject") == subject and
+            course.get("courseNumber") == course_number):
+            exact_matches.append(course)
+            logger.info(f"Found exact match: {subject}{course_number} - {course.get('courseTitle')}")
+
+    return exact_matches
+
+
+def _perform_semantic_search(query: str, k: int, preferred_subject: str, exact_matches: list,
+                             subject: str, course_number: str, index, id_to_course_list: list) -> list[dict]:
+    """
+    Perform semantic search with subject filtering and preference scoring.
+
+    Args:
+        query: Normalized search query
+        k: Number of results needed
+        preferred_subject: Subject code to boost in results (e.g., "MATH")
+        exact_matches: List of exact matches to avoid duplicates
+        subject: Course subject from exact match (if any)
+        course_number: Course number from exact match (if any)
+        index: FAISS index for semantic search
+        id_to_course_list: List of all courses with metadata
+
+    Returns:
+        list[dict]: Semantically similar courses, subject-filtered and ranked
+    """
+    query_emb = np.array([get_embedding(query)], dtype="float32")
+    _, indices = index.search(query_emb, k * 3)  # Get more results for filtering/reranking
+
+    # Collect candidates with subject-based scoring
+    candidates = []
+    for idx in indices[0]:
+        idx = int(idx)
+        course = id_to_course_list[idx]["course"]
+
+        # If we have exact matches, skip duplicates
+        if exact_matches:
+            course_code = f"{course.get('subject')}{course.get('courseNumber')}"
+            exact_code = f"{subject}{course_number}"
+            if course_code == exact_code:
+                continue  # Skip, already in exact_matches
+
+        # Calculate preference score
+        score = 0
+        if preferred_subject and course.get("subject") == preferred_subject:
+            score = 1  # Boost courses from preferred subject
+
+        candidates.append((course, score))
+
+    # Sort candidates: preferred subject first, then by semantic similarity (order from FAISS)
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    semantic_results = [course for course, _ in candidates[:k - len(exact_matches)]]
+
+    return semantic_results
+
+
+def _combine_and_rank_results(exact_matches: list, semantic_results: list, k: int) -> list[dict]:
+    """
+    Combine exact matches and semantic search results.
+
+    Exact matches are prioritized first, followed by semantic results.
+
+    Args:
+        exact_matches: Courses that exactly match the query
+        semantic_results: Semantically similar courses
+        k: Maximum number of results to return
+
+    Returns:
+        list[dict]: Combined and ranked course results
+    """
+    final_results = exact_matches + semantic_results
+    return final_results[:k]
+
+
 def search_courses(query: str, k: int = 3, subject_hint: str = None) -> list[dict]:
     """
     Search for courses using exact match + semantic similarity.
@@ -275,87 +347,7 @@ def search_courses(query: str, k: int = 3, subject_hint: str = None) -> list[dic
         # Detect subject preference - use hint if provided, otherwise auto-detect
         if subject_hint:
             # Map subject hint to subject code (e.g., "Music" -> "MUS")
-            # Complete mapping of natural language subject names to subject codes (all 62 subjects)
-            subject_mapping = {
-                # Common aliases
-                "math": "MATH",
-                "psych": "PSYC",
-                "cs": "CSCI",
-                "theater": "THEA",
-                "theatre": "THEA",
-                "nursing": "NRSR",
-                "esl": "ESL",
-                # Full subject names from course data
-                "applied art and design": "AAD",
-                "administration of justice": "ADMJ",
-                "advanced manufacturing": "ADVM",
-                "agriculture": "AGRI",
-                "allied health": "ALH",
-                "anthropology": "ANTH",
-                "art history": "ARHI",
-                "art": "ART",
-                "astronomy": "ASTR",
-                "athletics": "ATHL",
-                "automotive technology": "AUTO",
-                "automotive": "AUTO",
-                "building industries": "BI",
-                "biological sciences": "BIOL",
-                "biology": "BIOL",
-                "business": "BUS",
-                "chemistry": "CHEM",
-                "communication studies": "COMM",
-                "communication": "COMM",
-                "computer science": "CSCI",
-                "deaf studies": "DFST",
-                "economics": "ECON",
-                "education": "EDU",
-                "english": "ENGL",
-                "engineering": "ENGR",
-                "earth science": "ESCI",
-                "english as a second language": "ESL",
-                "environmental sciences": "ESS",
-                "ethnic studies": "ETHN",
-                "fashion": "FASH",
-                "fire technology": "FIRE",
-                "fire science": "FIRE",
-                "french": "FREN",
-                "geography": "GEOG",
-                "german": "GER",
-                "human development and family": "HDEV",
-                "health education": "HED",
-                "history": "HIST",
-                "health sciences": "HSCI",
-                "humanities": "HUM",
-                "information technology": "IT",
-                "italian": "ITAL",
-                "japanese": "JPN",
-                "kinesiology": "KIN",
-                "lgbt studies": "LGBT",
-                "mathematics": "MATH",
-                "mechatronics": "MECH",
-                "music": "MUS",
-                "nursing assistant": "NRSA",
-                "nursing registered": "NRSR",
-                "nutrition and food science": "NUTF",
-                "nutrition": "NUTF",
-                "personal development": "PDEV",
-                "philosophy": "PHIL",
-                "photography": "PHOT",
-                "physics": "PHYS",
-                "political science": "POLS",
-                "psychology": "PSYC",
-                "recreation management": "RECM",
-                "rise": "RISE",
-                "skill development": "SKDV",
-                "sociology": "SOC",
-                "spanish": "SPAN",
-                "statistics": "STAT",
-                "theatre arts": "THEA",
-                "welding technology": "WELD",
-                "welding": "WELD",
-                "women's studies": "WMST",
-            }
-            preferred_subject = subject_mapping.get(subject_hint.lower())
+            preferred_subject = SUBJECT_MAPPING.get(subject_hint.lower())
             if preferred_subject:
                 logger.info(f"Using subject hint from intent: {subject_hint} -> {preferred_subject}")
             else:
@@ -366,59 +358,21 @@ def search_courses(query: str, k: int = 3, subject_hint: str = None) -> list[dic
         # If we found a specific course code, try exact match first
         exact_matches = []
         if subject and course_number:
-            logger.info(f"Exact course code detected: {subject} {course_number}")
+            exact_matches = _find_exact_course_matches(subject, course_number, id_to_course_list)
 
-            for entry in id_to_course_list:
-                course = entry["course"]
-                if (course.get("subject") == subject and
-                    course.get("courseNumber") == course_number):
-                    exact_matches.append(course)
-                    logger.info(f"Found exact match: {subject}{course_number} - {course.get('courseTitle')}")
-
-            # If we have enough exact matches, return those
-            if len(exact_matches) >= k:
-                logger.info(f"Returning {k} exact matches")
+            # If we have enough exact matches, return those only (don't mix with semantic)
+            if exact_matches:
+                logger.info(f"Returning {len(exact_matches)} exact matches only (no semantic mixing)")
                 return exact_matches[:k]
-            elif exact_matches:
-                logger.info(f"Found {len(exact_matches)} exact matches, will supplement with semantic search")
-
-        # If we found exact matches for a specific course code, ONLY return those
-        # Don't mix with other courses from semantic search
-        if subject and course_number and exact_matches:
-            logger.info(f"Returning {len(exact_matches)} exact matches only (no semantic mixing)")
-            return exact_matches[:k]
 
         # Do semantic search (either as primary method or to supplement exact matches)
-        query_emb = np.array([get_embedding(normalized_query)], dtype="float32")
-        _, indices = index.search(query_emb, k * 3)  # Get more results for filtering/reranking
+        semantic_results = _perform_semantic_search(
+            normalized_query, k, preferred_subject, exact_matches,
+            subject, course_number, index, id_to_course_list
+        )
 
-        # Collect candidates with subject-based scoring
-        candidates = []
-        for idx in indices[0]:
-            idx = int(idx)
-            course = id_to_course_list[idx]["course"]
-
-            # If we have exact matches, skip duplicates
-            if exact_matches:
-                course_code = f"{course.get('subject')}{course.get('courseNumber')}"
-                exact_code = f"{subject}{course_number}"
-                if course_code == exact_code:
-                    continue  # Skip, already in exact_matches
-
-            # Calculate preference score
-            score = 0
-            if preferred_subject and course.get("subject") == preferred_subject:
-                score = 1  # Boost courses from preferred subject
-
-            candidates.append((course, score))
-
-        # Sort candidates: preferred subject first, then by semantic similarity (order from FAISS)
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        semantic_results = [course for course, _ in candidates[:k - len(exact_matches)]]
-
-        # Combine exact matches (first) with semantic results
-        final_results = exact_matches + semantic_results
-        return final_results[:k]
+        # Combine and rank results
+        return _combine_and_rank_results(exact_matches, semantic_results, k)
 
     except Exception as e:
         logger.error(f"Failed to search courses: {e}")

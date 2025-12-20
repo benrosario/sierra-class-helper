@@ -5,10 +5,8 @@ from playwright.sync_api import sync_playwright
 
 global TERM_MAP
 TERM_MAP = {
-    "spring2025": "#select2-result-label-5",
-    "summer2025": "#select2-result-label-4",
-    "fall2025": "#select2-result-label-3",
-    "spring2026": "#select2-result-label-2"
+    "spring2026": "#select2-result-label-3",
+    "summer2026": "#select2-result-label-2"
 }
 
 def process_json(course):
@@ -107,8 +105,6 @@ def sierra_scrape(term: str, debug: bool):
     term_element = ""
     
     match term:
-        case "fall2025":
-            term_element = "#select2-result-label-4"
         case "spring2026":
             term_element = "#select2-result-label-3"
         case "summer2026":

@@ -1,23 +1,10 @@
 from src.scraper.scraper import sierra_scrape
 
 TERM_MAP = {
-    #"spring2025": "#select2-result-label-5",
-    "spring2025",
-    #"summer2025": "#select2-result-label-4",
-    "summer2025",
-    #"fall2025": "#select2-result-label-3",
-    "fall2025",
-    #"spring2026": "#select2-result-label-2"
+    #"spring2026": "#select2-result-label-3"
     "spring2026",
-    
-    """
-    case "fall2025":
-            term_element = "select2-result-label-4"
-        case "spring2026":
-            term_element = "#select2-result-label-3"
-        case "summer2026":
-            term_element = "#select2-result-label-2"
-    """
+    #"summer2026": "#select2-result-label-2"
+    "summer2026"
 }
 
 running = True

@@ -20,10 +20,21 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-API_URL = os.environ.get("API_URL", "http://localhost:8000")
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
+API_URL = os.environ.get("API_URL")
 
 if not DISCORD_TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
+
+if ENVIRONMENT == "production" and not API_URL:
+    raise ValueError(
+        "API_URL environment variable is required in production. "
+        "On Railway this should be set automatically to the api service's private domain."
+    )
+
+# Dev-only fallback
+if not API_URL:
+    API_URL = "http://localhost:8000"
 
 # Bot setup with intents
 intents = discord.Intents.default()
@@ -35,6 +46,16 @@ bot = commands.Bot(
     intents=intents,
     description="Sierra Class Helper - Your AI Academic Advisor"
 )
+
+RATE_LIMIT_MESSAGE = (
+    "You're sending messages a little too fast for me to keep up. "
+    "Wait a moment and try again."
+)
+
+
+class RateLimited(Exception):
+    """Raised when the upstream API returns HTTP 429."""
+
 
 class SierraClassHelper(commands.Cog):
     """Main cog for Sierra Class Helper functionality"""
@@ -97,7 +118,8 @@ class SierraClassHelper(commands.Cog):
 
             async with self.session.post(
                 f"{API_URL}/chat",
-                json=request_data
+                json=request_data,
+                headers={"X-Discord-User": str(user_id)}
             ) as response:
                 if response.status == 200:
                     result = await response.json()
@@ -106,10 +128,16 @@ class SierraClassHelper(commands.Cog):
                     self.add_to_history(user_id, "assistant", result["response"])
 
                     return result
+                elif response.status == 429:
+                    # Roll back the user message we optimistically added — the call didn't go through
+                    self.get_user_history(user_id).pop()
+                    raise RateLimited()
                 else:
                     error_text = await response.text()
                     logger.error(f"API error {response.status}: {error_text}")
                     raise Exception(f"API returned status {response.status}")
+        except RateLimited:
+            raise
         except Exception as e:
             logger.error(f"Failed to call chat API: {e}")
             raise
@@ -140,6 +168,8 @@ class SierraClassHelper(commands.Cog):
 
             logger.info(f"Response sent to {interaction.user}")
 
+        except RateLimited:
+            await interaction.followup.send(RATE_LIMIT_MESSAGE, ephemeral=True)
         except Exception as e:
             logger.error(f"Error processing question: {e}")
             await interaction.followup.send(
@@ -271,6 +301,8 @@ async def on_message(message):
                     else:
                         await message.reply("Sorry, I'm having trouble processing your request right now.")
 
+                except RateLimited:
+                    await message.reply(RATE_LIMIT_MESSAGE)
                 except Exception as e:
                     logger.error(f"Error processing mention: {e}")
                     await message.reply(

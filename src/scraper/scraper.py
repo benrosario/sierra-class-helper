@@ -1,27 +1,58 @@
+"""
+Scrape Sierra College's course catalog using Playwright.
+
+Designed to run in two environments:
+  - Locally with a visible browser (--debug) for diagnosis.
+  - Headless in a container (Railway cron / CI) with no TTY.
+
+The container path adds Chromium flags that are needed on Railway and similar
+hosts (--no-sandbox, --disable-dev-shm-usage) and dumps a screenshot + page
+HTML to course_data/_debug/ on any failure so a postmortem is possible without
+a live browser.
+"""
+from __future__ import annotations
+
 import json
+import logging
 import math
 from datetime import datetime
-from playwright.sync_api import sync_playwright
+from pathlib import Path
+from typing import Optional
 
-global TERM_MAP
+from playwright.sync_api import (
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
+
+logger = logging.getLogger(__name__)
+
+# select2 dropdown option IDs Sierra exposes for each term. These are
+# auto-generated and shift around as terms come and go, so we treat them as a
+# fast path and fall back to text matching (see _select_term).
 TERM_MAP = {
     "spring2026": "#select2-result-label-3",
-    "summer2026": "#select2-result-label-2"
+    "summer2026": "#select2-result-label-2",
 }
+
+# Human-readable name Sierra uses in the dropdown. Used as the fallback selector.
+TERM_DISPLAY_NAMES = {
+    "spring2026": "Spring 2026",
+    "summer2026": "Summer 2026",
+}
+
+REGISTRATION_URL = (
+    "https://ss.sierracollege.edu:8885/StudentRegistrationSsb/"
+    "ssb/term/termSelection?mode=search"
+)
+
+OUTPUT_DIR = Path("course_data")
+DEBUG_DIR = OUTPUT_DIR / "_debug"
+
 
 def process_json(course):
     """
     Extract and format relevant fields from raw course API response.
-
-    Takes the full course JSON from Sierra College's API and extracts only
-    the fields needed for the chatbot, reformatted into a cleaner structure.
-
-    Args:
-        course: Raw course dictionary from the Sierra College API
-
-    Returns:
-        dict: Cleaned course data with only relevant fields (term, CRN, subject,
-              enrollment, faculty, meetings, etc.)
     """
     return {
         "term": course.get("termDesc"),
@@ -42,8 +73,9 @@ def process_json(course):
         "faculty": [
             {
                 "name": f.get("displayName"),
-                "email": f.get("emailAddress")
-            } for f in course.get("faculty", [])
+                "email": f.get("emailAddress"),
+            }
+            for f in course.get("faculty", [])
         ],
         "meetings": [
             {
@@ -69,127 +101,168 @@ def process_json(course):
         "attributes": [a.get("description") for a in course.get("sectionAttributes", [])],
     }
 
-courses_processed = 0
 
-def sierra_scrape(term: str, debug: bool):
+def _dump_debug_artifacts(page: Page, term: str, label: str) -> None:
+    """Save a full-page screenshot and the rendered HTML so a failure can be diagnosed offline."""
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    stem = f"{term}_{timestamp}_{label}"
+    screenshot_path = DEBUG_DIR / f"{stem}.png"
+    html_path = DEBUG_DIR / f"{stem}.html"
+
+    try:
+        page.screenshot(path=str(screenshot_path), full_page=True)
+        logger.error(f"Wrote debug screenshot: {screenshot_path}")
+    except Exception as e:
+        logger.error(f"Failed to write debug screenshot: {e}")
+
+    try:
+        html_path.write_text(page.content(), encoding="utf-8")
+        logger.error(f"Wrote debug HTML: {html_path}")
+    except Exception as e:
+        logger.error(f"Failed to write debug HTML: {e}")
+
+
+def _select_term(page: Page, term: str) -> None:
     """
-    Scrape course data from Sierra College's course search page.
+    Click through the term-selection dropdown.
 
-    Uses Playwright to automate browser interaction with Sierra's course search
-    system, intercepts API responses, and collects all course data for the
-    specified term.
-
-    Args:
-        term: Semester to scrape (e.g., "fall2025", "spring2026")
-              Must be a key in TERM_MAP
-        debug: If True, runs browser in headed mode (visible) for debugging
-
-    Returns:
-        dict: Dictionary mapping CRN to course data
-              Format: {CRN: {"course": {...course data...}}}
-
-    Raises:
-        ValueError: If term is not found in TERM_MAP
-
-    Example:
-        >>> courses = sierra_scrape("fall2025", debug=False)
-        >>> print(len(courses))
-        1234
+    Tries the hardcoded select2 ID first (fast path), then falls back to
+    matching the option by its visible text — which is resilient to the
+    auto-generated ID shifting when Sierra adds or removes terms.
     """
-    
-    print("Initializing...")
-    
-    if term not in TERM_MAP: 
-        raise ValueError(f"Invalid parameter given. \nAllowed parameters: {TERM_MAP}")
-    
-    term_element = ""
-    
-    match term:
-        case "spring2026":
-            term_element = "#select2-result-label-3"
-        case "summer2026":
-            term_element = "#select2-result-label-2"
-            
-    
-    with sync_playwright() as p: 
-        isHeadless = not debug
-        browser = p.chromium.launch(headless=isHeadless)
-        page = browser.new_page()
-        
-        classJson = {}
-        def handle_response(response):
-            global courses_processed
-            if "ssb/searchResults/searchResults?txt_term=" in response.url:
-                try:
-                    data = response.json()
-                    # Only store the 'data' element
-                    if "data" in data:
-                        for c in data["data"]:
-                            classJson[ c.get("courseReferenceNumber") ] = process_json(c)
-                        
-                        courses_processed += len(data['data'])
-                        
-                        percent_complete = (courses_processed/total_classes)*100
-                        print(f"{percent_complete:.2f}% complete")
-                except Exception as e:
-                    print("Failed to parse JSON: ", e)          
-        
-        
-        page.goto("https://ss.sierracollege.edu:8885/StudentRegistrationSsb/ssb/term/termSelection?mode=search")
-        
-        # Open the dropdown
-        page.locator("#select2-chosen-1").click()
-        
-        # Click on chosen term
-        # page.wait_for_timeout(2000)
-        page.locator(term_element).click()
-        
-        # Click 'Continue'
-        page.locator("#term-go").click()
-        
-        # Search for all classes in selected term
-        page.locator("#search-go").click()
-        
-        # We are now looking at all courses for the selected term
-        page.wait_for_selector("tbody tr[data-id]")
-        page.wait_for_timeout(3000)
-        
-        total_classes_str = page.locator("span.results-out-of").inner_text()
-        total_classes = int(total_classes_str.split()[0])
-        total_pages = math.ceil(total_classes / 50)
-        
-        if debug:
-            print(f"Total Pages: {total_pages}")
-        
-        # Snoop for JSON response
-        page.on("response", handle_response)  
-        
-        # Change courses listed per page
-        page.select_option("select.page-size-select", "50")
-        page.wait_for_timeout(3000)
-        
-        
-        
-        for i in range(total_pages):
-            page.wait_for_selector("tbody tr[data-id]", timeout=5000)
-            page.wait_for_timeout(900)
-            
-            if i < total_pages - 1:
-                page.locator("button[title='Next']").click()
-            page.wait_for_timeout(2000)
-        
-        if len(classJson) > 0:
-                timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S%z")
-                filepath = f"course_data/{term}_{timestamp}.json"
-                
-                with open(f"{filepath}", "w", encoding="utf-8") as f:
-                    # pretty-print JSON
-                    json.dump(classJson, f, indent=2, ensure_ascii=False)
-                print(f"Finished. {courses_processed} courses scraped.")
-                print(f"JSON saved under {filepath}")
+    element_id = TERM_MAP[term]
+    display = TERM_DISPLAY_NAMES.get(term, term)
+
+    logger.info("Opening term dropdown")
+    page.locator("#select2-chosen-1").click()
+
+    try:
+        logger.info(f"Trying hardcoded selector: {element_id}")
+        page.locator(element_id).click(timeout=3000)
+        logger.info(f"Selected term via hardcoded ID: {element_id}")
+        return
+    except PlaywrightTimeoutError:
+        logger.warning(
+            f"Hardcoded selector {element_id} didn't resolve in time. "
+            f"Falling back to text match for '{display}'."
+        )
+
+    page.locator("li.select2-results__option", has_text=display).first.click(timeout=5000)
+    logger.info(f"Selected term via text match: '{display}'")
+
+
+def sierra_scrape(term: str, debug: bool = False) -> dict:
+    """
+    Scrape course data for a single term and write it to course_data/.
+
+    Returns the dict of {CRN: course_data} that was written.
+
+    Raises any Playwright exception after dumping a screenshot + HTML to
+    course_data/_debug/. Also raises RuntimeError if the scrape completes but
+    captured zero courses, which usually means the page structure changed.
+    """
+    if term not in TERM_MAP:
+        raise ValueError(f"Invalid term '{term}'. Allowed: {list(TERM_MAP.keys())}")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    courses_processed = 0
+    total_classes = 0
+    classJson: dict = {}
+
+    def handle_response(response):
+        nonlocal courses_processed
+        if "ssb/searchResults/searchResults?txt_term=" not in response.url:
+            return
+        try:
+            data = response.json()
+        except Exception as e:
+            logger.warning(f"Search response was not JSON-decodable: {e}")
+            return
+        rows = data.get("data") or []
+        if not rows:
+            return
+        for c in rows:
+            classJson[c.get("courseReferenceNumber")] = process_json(c)
+        courses_processed += len(rows)
+        if total_classes:
+            pct = (courses_processed / total_classes) * 100
+            logger.info(f"Progress: {courses_processed}/{total_classes} ({pct:.1f}%)")
         else:
-            print("No classes were found.")
-        
-        # Pause to inspect the page
-        if debug:
-            input("Press 'enter' to close...")
+            logger.info(f"Progress: captured {courses_processed} courses so far")
+
+    # Chromium flags required for containerized hosts like Railway. Safe locally.
+    launch_args = []
+    if not debug:
+        launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+
+    logger.info(f"Launching Chromium (headless={not debug}, args={launch_args})")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not debug, args=launch_args)
+        page: Optional[Page] = None
+        try:
+            page = browser.new_page()
+
+            logger.info(f"Navigating to {REGISTRATION_URL}")
+            page.goto(REGISTRATION_URL, timeout=60000)
+
+            _select_term(page, term)
+
+            logger.info("Clicking 'Continue'")
+            page.locator("#term-go").click()
+
+            logger.info("Submitting search for all courses in term")
+            page.locator("#search-go").click()
+
+            logger.info("Waiting for results table to render")
+            page.wait_for_selector("tbody tr[data-id]", timeout=30000)
+            page.wait_for_timeout(3000)
+
+            total_classes_str = page.locator("span.results-out-of").inner_text()
+            total_classes = int(total_classes_str.split()[0])
+            total_pages = math.ceil(total_classes / 50)
+            logger.info(f"Sierra reports {total_classes} courses across {total_pages} pages")
+
+            # Register the response handler AFTER we know total_classes, so the
+            # progress percentage is meaningful.
+            page.on("response", handle_response)
+
+            logger.info("Setting results-per-page to 50")
+            page.select_option("select.page-size-select", "50")
+            page.wait_for_timeout(3000)
+
+            for i in range(total_pages):
+                page.wait_for_selector("tbody tr[data-id]", timeout=15000)
+                page.wait_for_timeout(900)
+                if i < total_pages - 1:
+                    logger.info(f"Advancing to page {i + 2}/{total_pages}")
+                    page.locator("button[title='Next']").click()
+                page.wait_for_timeout(2000)
+
+            logger.info(f"Pagination complete. Captured {len(classJson)} unique courses.")
+
+            if len(classJson) == 0:
+                logger.error("No courses captured — page structure may have changed.")
+                _dump_debug_artifacts(page, term, "empty_result")
+                raise RuntimeError(f"Scrape for {term} produced zero courses")
+
+            timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S%z")
+            filepath = OUTPUT_DIR / f"{term}_{timestamp}.json"
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(classJson, f, indent=2, ensure_ascii=False)
+            logger.info(f"Wrote {len(classJson)} courses to {filepath}")
+
+            if debug:
+                input("Press 'enter' to close...")
+
+            return classJson
+
+        except Exception:
+            logger.exception(f"Scrape failed for {term}")
+            if page is not None:
+                _dump_debug_artifacts(page, term, "exception")
+            raise
+        finally:
+            browser.close()

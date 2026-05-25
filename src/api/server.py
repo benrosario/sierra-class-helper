@@ -2,7 +2,7 @@
 FastAPI server for Sierra Class Helper
 Provides REST API endpoints for course search and chat functionality
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
@@ -10,7 +10,11 @@ import os
 import json
 from datetime import datetime
 from openai import OpenAI
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from src.embeddings.core import search_courses, course_to_text
+from src.utils.professor_ratings import get_rating, format_rating
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -20,20 +24,37 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def _rate_limit_key(request: Request) -> str:
+    """
+    Key requests by Discord user when available, falling back to IP.
+
+    All bot traffic shares one Railway IP, so we can't usefully rate limit on IP
+    alone. The bot forwards the Discord user ID in X-Discord-User; for any other
+    caller we degrade to per-IP.
+    """
+    return request.headers.get("X-Discord-User") or get_remote_address(request)
+
+
+limiter = Limiter(key_func=_rate_limit_key)
+
 # Initialize FastAPI
 app = FastAPI(
     title="Sierra Class Helper API",
     description="API for searching Sierra College courses and getting AI-powered academic advice",
     version="1.0.0"
 )
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# Add CORS middleware
+# CORS is intentionally restrictive: the only client is the Discord bot, which calls
+# this API server-to-server (no browser involved). If a browser-based client is added
+# later, list its exact origin here.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-Discord-User"],
 )
 
 # Initialize OpenAI client
@@ -351,6 +372,7 @@ def get_system_prompts():
         "IMPORTANT: When listing courses, ALWAYS show the full course name (e.g., 'College Algebra (MATH0012)') at the start of each course listing.",
         "IMPORTANT: ALWAYS include the CRN (Course Reference Number) for EVERY course you list. The CRN is critical information that students need to register. Example format: 'CRN: 12345' or include it prominently in the course listing.",
         "IMPORTANT: ALWAYS include the instructor's name for EVERY course you list. If multiple instructors, list all of them. If no instructor is assigned, clearly state 'Instructor: TBA' or 'No instructor assigned'.",
+        "When a course's context includes 'Instructor ratings (RateMyProfessors):', append the rating in parentheses right after the instructor's name (e.g., 'Instructor: Dan Groff (RMP: 3.8/5, 27 ratings, 75% would take again)'). If no rating data is provided for an instructor, simply omit it — do NOT say 'no rating available' or similar. Do not invent ratings.",
         "IMPORTANT: ALWAYS show the campus location prominently for each course (e.g., 'Rocklin Campus', 'Nevada County Campus', 'Online', or 'Unknown Campus').",
         "IMPORTANT: You are being provided with the TOP matching courses based on semantic search. There may be many more courses available. Do NOT say these are the ONLY courses - say 'Here are the top matches' or 'Here are some relevant courses'.",
         "IMPORTANT: Count the courses carefully. If you receive 3 courses, say '3 courses', not '2 courses'.",
@@ -671,6 +693,26 @@ def _handle_no_results(request: ChatRequest, intent: dict) -> ChatResponse:
     )
 
 
+def _augment_with_ratings(course_text: str, course: dict) -> str:
+    """Append RateMyProfessors ratings (if any) under a course's LLM context block."""
+    rating_lines = []
+    for item in course.get("faculty", []) or []:
+        name = item.get("name", "")
+        rating = get_rating(name)
+        if not rating:
+            continue
+        formatted = format_rating(rating)
+        if not formatted:
+            continue
+        line = f"  {name}: {formatted}"
+        if rating.get("url"):
+            line += f" (source: {rating['url']})"
+        rating_lines.append(line)
+    if not rating_lines:
+        return course_text
+    return course_text + "Instructor ratings (RateMyProfessors):\n" + "\n".join(rating_lines) + "\n"
+
+
 def _generate_course_response(request: ChatRequest, results: list[dict]) -> ChatResponse:
     """
     Generate final LLM response with course data.
@@ -682,8 +724,8 @@ def _generate_course_response(request: ChatRequest, results: list[dict]) -> Chat
     Returns:
         ChatResponse with generated answer and course count
     """
-    # Build context from search results
-    context = "\n".join(course_to_text(r) for r in results)
+    # Build context from search results (with professor ratings appended where available)
+    context = "\n".join(_augment_with_ratings(course_to_text(r), r) for r in results)
 
     # Generate response using OpenAI
     messages = [
@@ -721,24 +763,27 @@ def _generate_course_response(request: ChatRequest, results: list[dict]) -> Chat
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+@limiter.limit("20/minute")
+@limiter.limit("200/day")
+async def chat(request: Request, body: ChatRequest):
     """
     Chat endpoint that searches courses and generates AI response
 
-    Uses RAG to provide context-aware responses
+    Uses RAG to provide context-aware responses. Rate limited per Discord user
+    (via X-Discord-User header) or per IP if header is absent.
     """
     try:
-        logger.info(f"Chat request: {request.message}")
+        logger.info(f"Chat request: {body.message}")
 
         # Check if this is a course-related question
-        is_course_question = is_course_related_question(request.message)
+        is_course_question = is_course_related_question(body.message)
 
         if not is_course_question:
-            return _handle_non_course_question(request)
+            return _handle_non_course_question(body)
 
         # For course-related questions, proceed with normal RAG pipeline
         # Build enhanced search query with conversation context
-        search_query = _build_search_query(request)
+        search_query = _build_search_query(body)
 
         # Extract user intent for intelligent filtering
         intent = extract_user_intent(search_query)
@@ -750,7 +795,7 @@ async def chat(request: ChatRequest):
         candidate_results = search_courses(search_query, k=30, subject_hint=subject_hint)
 
         # Filter and validate candidates
-        validated_results = _filter_and_validate_courses(candidate_results, intent, request.num_courses)
+        validated_results = _filter_and_validate_courses(candidate_results, intent, body.num_courses)
 
         # If validation rejected all courses, retry search without subject hint
         # This handles cases where LLM picked wrong subject (e.g., "Engineering" instead of "Mechatronics")
@@ -760,7 +805,7 @@ async def chat(request: ChatRequest):
 
             # Retry search without subject bias
             retry_candidates = search_courses(search_query, k=30, subject_hint=None)
-            validated_results = _filter_and_validate_courses(retry_candidates, intent, request.num_courses)
+            validated_results = _filter_and_validate_courses(retry_candidates, intent, body.num_courses)
 
             if validated_results:
                 logger.info(f"Retry successful: Found {len(validated_results)} courses without subject hint")
@@ -771,11 +816,13 @@ async def chat(request: ChatRequest):
 
         # If still no results after retry, inform user
         if not results:
-            return _handle_no_results(request, intent)
+            return _handle_no_results(body, intent)
 
         # Generate final response with course data
-        return _generate_course_response(request, results)
+        return _generate_course_response(body, results)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Chat failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

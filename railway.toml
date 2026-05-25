@@ -47,7 +47,10 @@ name = "course-updater"
 source = "."
 
 [services.buildCommand]
-command = "pip install -r requirements.txt && playwright install chromium"
+# --with-deps installs the Linux system libraries Chromium needs
+# (libnss3, libatk-bridge2.0-0, libgbm1, etc.). Without it the
+# browser fails to launch on the Railway Nixpacks image.
+command = "pip install -r requirements.txt && playwright install --with-deps chromium"
 
 [services.startCommand]
 command = "python update_courses.py"
@@ -57,6 +60,25 @@ command = "python update_courses.py"
 # In UTC: 3pm-11pm + midnight-3am = 15-23,0-3
 # Note: During PST (winter), this runs 9am-9pm instead of 8am-8pm
 schedule = "0 15-23,0-3 * * *"
+
+[services.env]
+ENVIRONMENT = "production"
+
+# RateMyProfessors Ratings Updater Cron Job
+# Refreshes professor_ratings.json daily. Ratings change slowly so once a day is plenty.
+[[services]]
+name = "ratings-updater"
+source = "."
+
+[services.buildCommand]
+command = "pip install -r requirements.txt"
+
+[services.startCommand]
+command = "python -m src.scraper.ratemyprofessors"
+
+[services.cron]
+# Daily at 2am Pacific (10am UTC during PDT, 9am during PST)
+schedule = "0 10 * * *"
 
 [services.env]
 ENVIRONMENT = "production"

@@ -27,6 +27,17 @@ class Config:
     # Environment
     ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
 
+    @classmethod
+    def require_api_url(cls):
+        """Return API_URL, but refuse the localhost default in production."""
+        api_url = os.environ.get("API_URL")
+        if cls.is_production() and not api_url:
+            raise ValueError(
+                "API_URL environment variable is required in production. "
+                "On Railway this should be set automatically to the api service's private domain."
+            )
+        return api_url or "http://localhost:8000"
+
     # Data files
     INDEX_FILE = "courses.index"
     METADATA_FILE = "id_to_course.json"

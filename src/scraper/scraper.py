@@ -15,39 +15,61 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from playwright.sync_api import (
-    Page,
-    TimeoutError as PlaywrightTimeoutError,
-    sync_playwright,
-)
+from playwright.sync_api import Page, sync_playwright
+
+from src.utils.paths import COURSE_DATA_DIR, DEBUG_DIR
 
 logger = logging.getLogger(__name__)
 
-# select2 dropdown option IDs Sierra exposes for each term. These are
-# auto-generated and shift around as terms come and go, so we treat them as a
-# fast path and fall back to text matching (see _select_term).
-TERM_MAP = {
-    "spring2026": "#select2-result-label-3",
-    "summer2026": "#select2-result-label-2",
-}
+BANNER_HOST = "https://ss.oci.sierracollege.edu"
+REGISTRATION_URL = f"{BANNER_HOST}/StudentRegistrationSsb/ssb/term/termSelection?mode=search"
+TERMS_API = f"{BANNER_HOST}/StudentRegistrationSsb/ssb/classSearch/getTerms"
 
-# Human-readable name Sierra uses in the dropdown. Used as the fallback selector.
-TERM_DISPLAY_NAMES = {
-    "spring2026": "Spring 2026",
-    "summer2026": "Summer 2026",
-}
+OUTPUT_DIR = COURSE_DATA_DIR
 
-REGISTRATION_URL = (
-    "https://ss.sierracollege.edu:8885/StudentRegistrationSsb/"
-    "ssb/term/termSelection?mode=search"
-)
 
-OUTPUT_DIR = Path("course_data")
-DEBUG_DIR = OUTPUT_DIR / "_debug"
+def get_active_terms(max_terms: int = 20) -> list[dict]:
+    """
+    Fetch the list of currently registerable terms from Banner.
+
+    Returns a list of dicts shaped like {"code": "202680", "description": "Fall 2026"},
+    excluding anything marked "(View Only)" (past terms or terms that closed for
+    registration). The list comes back newest-first.
+
+    This is the recommended way to know what to scrape: Banner's getTerms API
+    is the source of truth and updates the moment Sierra opens a new term.
+    """
+    params = f"?searchTerm=&offset=1&max={max_terms}&dataType=json"
+    req = urllib.request.Request(
+        TERMS_API + params,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; SierraClassHelper/1.0)"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        terms = json.loads(resp.read().decode("utf-8"))
+
+    active = [
+        {"code": t["code"], "description": t["description"]}
+        for t in terms
+        if "(View Only)" not in (t.get("description") or "")
+    ]
+    logger.info(f"Banner reports {len(active)} active term(s): {[t['description'] for t in active]}")
+    return active
+
+
+def term_slug(description: str) -> str:
+    """
+    Derive the filename slug from a term description.
+
+    "Fall 2026" -> "fall2026". Matches the convention course_loader uses to
+    extract the source_term from filenames (everything before the first underscore).
+    """
+    return re.sub(r"[^a-z0-9]", "", description.lower())
 
 
 def process_json(course):
@@ -123,38 +145,33 @@ def _dump_debug_artifacts(page: Page, term: str, label: str) -> None:
         logger.error(f"Failed to write debug HTML: {e}")
 
 
-def _select_term(page: Page, term: str) -> None:
+def _select_term(page: Page, description: str) -> None:
     """
-    Click through the term-selection dropdown.
+    Click the term-selection dropdown and pick the option matching `description`.
 
-    Tries the hardcoded select2 ID first (fast path), then falls back to
-    matching the option by its visible text — which is resilient to the
-    auto-generated ID shifting when Sierra adds or removes terms.
+    Uses an exact text match against the dropdown's labels. Sierra's Banner
+    runs select2 3.x, so the options are `li.select2-result-selectable` and
+    the visible text lives in a child `.select2-result-label`.
     """
-    element_id = TERM_MAP[term]
-    display = TERM_DISPLAY_NAMES.get(term, term)
-
     logger.info("Opening term dropdown")
     page.locator("#select2-chosen-1").click()
 
-    try:
-        logger.info(f"Trying hardcoded selector: {element_id}")
-        page.locator(element_id).click(timeout=3000)
-        logger.info(f"Selected term via hardcoded ID: {element_id}")
-        return
-    except PlaywrightTimeoutError:
-        logger.warning(
-            f"Hardcoded selector {element_id} didn't resolve in time. "
-            f"Falling back to text match for '{display}'."
-        )
+    logger.info("Waiting for dropdown options to populate")
+    page.wait_for_selector("li.select2-result-selectable", timeout=10000)
 
-    page.locator("li.select2-results__option", has_text=display).first.click(timeout=5000)
-    logger.info(f"Selected term via text match: '{display}'")
+    logger.info(f"Selecting term by exact text: '{description}'")
+    exact = re.compile(f"^{re.escape(description)}$")
+    page.locator(".select2-result-label").filter(has_text=exact).first.click(timeout=5000)
+    logger.info(f"Selected term: '{description}'")
 
 
-def sierra_scrape(term: str, debug: bool = False) -> dict:
+def sierra_scrape(term: dict, debug: bool = False) -> dict:
     """
     Scrape course data for a single term and write it to course_data/.
+
+    `term` is a dict like {"code": "202680", "description": "Fall 2026"} — the
+    same shape get_active_terms() returns. We use the description to drive the
+    dropdown click and derive a filename slug from it.
 
     Returns the dict of {CRN: course_data} that was written.
 
@@ -162,8 +179,11 @@ def sierra_scrape(term: str, debug: bool = False) -> dict:
     course_data/_debug/. Also raises RuntimeError if the scrape completes but
     captured zero courses, which usually means the page structure changed.
     """
-    if term not in TERM_MAP:
-        raise ValueError(f"Invalid term '{term}'. Allowed: {list(TERM_MAP.keys())}")
+    if not isinstance(term, dict) or "description" not in term:
+        raise ValueError(f"term must be a dict with at least 'description'; got: {term!r}")
+
+    description = term["description"]
+    slug = term_slug(description)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -208,7 +228,7 @@ def sierra_scrape(term: str, debug: bool = False) -> dict:
             logger.info(f"Navigating to {REGISTRATION_URL}")
             page.goto(REGISTRATION_URL, timeout=60000)
 
-            _select_term(page, term)
+            _select_term(page, description)
 
             logger.info("Clicking 'Continue'")
             page.locator("#term-go").click()
@@ -245,11 +265,11 @@ def sierra_scrape(term: str, debug: bool = False) -> dict:
 
             if len(classJson) == 0:
                 logger.error("No courses captured — page structure may have changed.")
-                _dump_debug_artifacts(page, term, "empty_result")
-                raise RuntimeError(f"Scrape for {term} produced zero courses")
+                _dump_debug_artifacts(page, slug, "empty_result")
+                raise RuntimeError(f"Scrape for {description} produced zero courses")
 
             timestamp = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S%z")
-            filepath = OUTPUT_DIR / f"{term}_{timestamp}.json"
+            filepath = OUTPUT_DIR / f"{slug}_{timestamp}.json"
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(classJson, f, indent=2, ensure_ascii=False)
             logger.info(f"Wrote {len(classJson)} courses to {filepath}")
@@ -260,9 +280,9 @@ def sierra_scrape(term: str, debug: bool = False) -> dict:
             return classJson
 
         except Exception:
-            logger.exception(f"Scrape failed for {term}")
+            logger.exception(f"Scrape failed for {description}")
             if page is not None:
-                _dump_debug_artifacts(page, term, "exception")
+                _dump_debug_artifacts(page, slug, "exception")
             raise
         finally:
             browser.close()

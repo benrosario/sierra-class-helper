@@ -23,9 +23,11 @@ import re
 from pathlib import Path
 from typing import Optional
 
+from src.utils.paths import PROFESSOR_RATINGS_JSON
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_PATH = "professor_ratings.json"
+DEFAULT_PATH = str(PROFESSOR_RATINGS_JSON)
 
 _cache: dict | None = None
 _cache_path: str | None = None

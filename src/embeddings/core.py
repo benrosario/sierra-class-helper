@@ -12,6 +12,7 @@ from src.utils.course_formatting import informalName, meetingDays
 from src.utils.campus import get_campus
 from src.utils.subject_mapping import SUBJECT_MAPPING
 from src.utils.course_loader import load_all_semesters
+from src.utils.paths import COURSES_INDEX, ID_TO_COURSE_JSON, ensure_dirs
 from src.utils.embedding_helpers import (
     estimate_tokens,
     get_embeddings_batch as get_embeddings_batch_helper,
@@ -30,8 +31,11 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 dimension = 1536
-index_file = "courses.index"
-metadata_file = "id_to_course.json"
+index_file = str(COURSES_INDEX)
+metadata_file = str(ID_TO_COURSE_JSON)
+
+# Make sure the data directory exists before anything tries to write into it.
+ensure_dirs()
 
 # Load all course data from all semesters
 courses = load_all_semesters()
@@ -114,6 +118,27 @@ def get_valid_subjects() -> set:
 # Initialize valid subjects cache (computed once at startup)
 VALID_SUBJECTS = get_valid_subjects()
 logger.info(f"Loaded {len(VALID_SUBJECTS)} valid subject codes")
+
+
+def reload_index() -> None:
+    """
+    Re-read courses.index and id_to_course.json from disk and swap the
+    module-level globals in place. Called by the in-process scheduler after a
+    fresh scrape + embeddings rebuild so the API picks up new data without a
+    restart.
+
+    Reassignment of module globals is atomic in Python — concurrent searches
+    will see either the old index or the new one, never a mix.
+    """
+    global index, id_to_course_list, VALID_SUBJECTS
+    logger.info("Reloading FAISS index and metadata from disk...")
+    new_index = faiss.read_index(index_file)
+    with open(metadata_file, "r", encoding="utf-8") as f:
+        new_metadata = json.load(f)
+    index = new_index
+    id_to_course_list = new_metadata
+    VALID_SUBJECTS = get_valid_subjects()
+    logger.info(f"Reload complete: {len(id_to_course_list)} courses, {len(VALID_SUBJECTS)} subjects")
 
 def normalize_course_query(query: str) -> str:
     """

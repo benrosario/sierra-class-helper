@@ -10,6 +10,7 @@ import hashlib
 from pathlib import Path
 from datetime import datetime
 from src.utils.course_loader import load_all_semesters
+from src.utils.paths import COURSE_HASHES_NO_ENROLLMENT_JSON
 from src.embeddings.incremental import (
     compute_course_hash,
     load_course_hashes,
@@ -62,7 +63,7 @@ def fast_incremental_update():
         new_hashes_no_enrollment[crn] = compute_course_hash_without_enrollment(course_data)
 
     # Also load old hashes without enrollment (if exists)
-    hash_no_enroll_file = "course_hashes_no_enrollment.json"
+    hash_no_enroll_file = str(COURSE_HASHES_NO_ENROLLMENT_JSON)
     if os.path.exists(hash_no_enroll_file):
         with open(hash_no_enroll_file, 'r') as f:
             old_hashes_no_enrollment = json.load(f)

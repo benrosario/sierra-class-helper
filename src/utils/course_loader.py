@@ -8,8 +8,10 @@ from JSON files in the course_data directory.
 import json
 from pathlib import Path
 
+from src.utils.paths import COURSE_DATA_DIR
 
-def load_all_semesters(directory="course_data"):
+
+def load_all_semesters(directory=None):
     """
     Load all course data from JSON files in the specified directory.
 
@@ -30,6 +32,9 @@ def load_all_semesters(directory="course_data"):
         "fall2025"
     """
     all_courses = {}
+
+    if directory is None:
+        directory = COURSE_DATA_DIR
 
     for json_file in Path(directory).glob("*.json"):
         with open(json_file, 'r') as f:

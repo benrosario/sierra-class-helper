@@ -2,6 +2,7 @@
 FastAPI server for Sierra Class Helper
 Provides REST API endpoints for course search and chat functionality
 """
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -13,7 +14,10 @@ from openai import OpenAI
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+from src.api.analytics import get_stats, init_schema, record_message
+from src.api.scheduler import start_scheduler, stop_scheduler
 from src.embeddings.core import search_courses, course_to_text
+from src.utils.paths import ID_TO_COURSE_JSON
 from src.utils.professor_ratings import get_rating, format_rating
 from dotenv import load_dotenv
 
@@ -37,11 +41,25 @@ def _rate_limit_key(request: Request) -> str:
 
 limiter = Limiter(key_func=_rate_limit_key)
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start the in-process scheduler on app boot (gated by env var)."""
+    init_schema()
+    if os.environ.get("SIERRA_ENABLE_SCHEDULER") == "1":
+        start_scheduler()
+    else:
+        logger.info("SIERRA_ENABLE_SCHEDULER not set; skipping background scheduler.")
+    yield
+    stop_scheduler()
+
+
 # Initialize FastAPI
 app = FastAPI(
     title="Sierra Class Helper API",
     description="API for searching Sierra College courses and getting AI-powered academic advice",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -81,9 +99,8 @@ class ChatResponse(BaseModel):
 # Function to get data freshness info (dynamically checks on each call)
 def get_data_last_updated():
     """Get the last modified time of id_to_course.json"""
-    import os.path
-    if os.path.exists("id_to_course.json"):
-        data_timestamp = os.path.getmtime("id_to_course.json")
+    if ID_TO_COURSE_JSON.exists():
+        data_timestamp = ID_TO_COURSE_JSON.stat().st_mtime
         return datetime.fromtimestamp(data_timestamp).strftime('%B %d, %Y at %I:%M %p')
     return None
 
@@ -413,6 +430,21 @@ async def health():
         "status": "healthy",
         "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
     }
+
+
+@app.get("/admin/stats")
+async def admin_stats(token: str = ""):
+    """
+    Return engagement aggregates. Gated by a shared secret to keep the data
+    private. Set SIERRA_ADMIN_TOKEN in the api env and pass ?token=... when
+    calling.
+    """
+    expected = os.environ.get("SIERRA_ADMIN_TOKEN")
+    if not expected:
+        raise HTTPException(status_code=503, detail="Stats endpoint not configured")
+    if token != expected:
+        raise HTTPException(status_code=403, detail="Invalid token")
+    return get_stats()
 
 @app.post("/search")
 async def search(request: CourseSearchRequest):
@@ -774,6 +806,7 @@ async def chat(request: Request, body: ChatRequest):
     """
     try:
         logger.info(f"Chat request: {body.message}")
+        record_message(request.headers.get("X-Discord-User"), len(body.message))
 
         # Check if this is a course-related question
         is_course_question = is_course_related_question(body.message)

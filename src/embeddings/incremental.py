@@ -16,6 +16,7 @@ from datetime import datetime
 from src.utils.course_formatting import informalName, meetingDays
 from src.utils.campus import get_campus
 from src.utils.course_loader import load_all_semesters
+from src.utils.paths import COURSES_INDEX, ID_TO_COURSE_JSON, COURSE_HASHES_JSON
 from src.utils.embedding_helpers import (
     get_embeddings_batch as get_embeddings_batch_helper,
     get_embedding as get_embedding_helper,
@@ -33,9 +34,9 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 
 dimension = 1536
-index_file = "courses.index"
-metadata_file = "id_to_course.json"
-hash_file = "course_hashes.json"  # Track which courses have changed
+index_file = str(COURSES_INDEX)
+metadata_file = str(ID_TO_COURSE_JSON)
+hash_file = str(COURSE_HASHES_JSON)  # Track which courses have changed
 
 def compute_course_hash(course_data):
     """Compute a hash of course data to detect changes"""

@@ -15,6 +15,8 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+from src.utils.paths import PROFESSOR_RATINGS_JSON
+
 logger = logging.getLogger(__name__)
 
 GRAPHQL_URL = "https://www.ratemyprofessors.com/graphql"
@@ -22,7 +24,7 @@ GRAPHQL_URL = "https://www.ratemyprofessors.com/graphql"
 AUTH_HEADER = "Basic dGVzdDp0ZXN0"
 SCHOOL_NAME = "Sierra College"
 SCHOOL_CITY = "Rocklin"  # disambiguates from any other "Sierra College" in the DB
-OUTPUT_FILE = "professor_ratings.json"
+OUTPUT_FILE = str(PROFESSOR_RATINGS_JSON)
 PAGE_SIZE = 1000
 
 SCHOOL_SEARCH_QUERY = """

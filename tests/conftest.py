@@ -4,6 +4,8 @@ Shared pytest fixtures for Sierra Class Helper tests
 import pytest
 import os
 
+from src.utils.paths import COURSES_INDEX, ID_TO_COURSE_JSON
+
 
 def pytest_configure(config):
     """Register custom markers"""
@@ -19,8 +21,8 @@ requires_openai = pytest.mark.skipif(
 )
 
 requires_faiss_index = pytest.mark.skipif(
-    not (os.path.exists("courses.index") and os.path.exists("id_to_course.json")),
-    reason="FAISS index (courses.index) or metadata (id_to_course.json) not found"
+    not (COURSES_INDEX.exists() and ID_TO_COURSE_JSON.exists()),
+    reason="FAISS index or metadata not found at SIERRA_DATA_DIR"
 )
 
 

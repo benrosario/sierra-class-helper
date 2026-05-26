@@ -40,6 +40,7 @@ if not API_URL:
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
+intents.dm_messages = True  # required so on_message fires for direct messages
 
 bot = commands.Bot(
     command_prefix=commands.when_mentioned,  # Only respond to mentions, no prefix
@@ -146,7 +147,7 @@ class SierraClassHelper(commands.Cog):
     @app_commands.describe(question="Your question about Sierra College courses")
     async def ask_command(self, interaction: discord.Interaction, question: str):
         """Ask Sierra Class Helper a question about courses"""
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        await interaction.response.defer(thinking=True, ephemeral=False)
 
         try:
             logger.info(f"Question from {interaction.user}: {question}")
@@ -158,24 +159,24 @@ class SierraClassHelper(commands.Cog):
             response_text = result["response"]
 
             if len(response_text) <= 2000:
-                await interaction.followup.send(response_text, ephemeral=True)
+                await interaction.followup.send(response_text, ephemeral=False)
             else:
                 # Split into chunks
                 chunks = [response_text[i:i+2000] for i in range(0, len(response_text), 2000)]
-                await interaction.followup.send(chunks[0], ephemeral=True)
+                await interaction.followup.send(chunks[0], ephemeral=False)
                 for chunk in chunks[1:]:
-                    await interaction.followup.send(chunk, ephemeral=True)
+                    await interaction.followup.send(chunk, ephemeral=False)
 
             logger.info(f"Response sent to {interaction.user}")
 
         except RateLimited:
-            await interaction.followup.send(RATE_LIMIT_MESSAGE, ephemeral=True)
+            await interaction.followup.send(RATE_LIMIT_MESSAGE, ephemeral=False)
         except Exception as e:
             logger.error(f"Error processing question: {e}")
             await interaction.followup.send(
                 "Sorry, I encountered an error processing your question. "
                 "Please try again later or contact support.",
-                ephemeral=True
+                ephemeral=False
             )
 
     @app_commands.command(name="clear", description="Clear your conversation history with the bot")
@@ -184,14 +185,14 @@ class SierraClassHelper(commands.Cog):
         self.clear_user_history(interaction.user.id)
         await interaction.response.send_message(
             "✅ Your conversation history has been cleared! I'll start fresh with your next message.",
-            ephemeral=True
+            ephemeral=False
         )
 
     @app_commands.command(name="search", description="Search for courses (raw data without AI formatting)")
     @app_commands.describe(query="Search query for courses")
     async def search_command(self, interaction: discord.Interaction, query: str):
         """Search for courses (returns raw data without AI formatting)"""
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        await interaction.response.defer(thinking=True, ephemeral=False)
 
         try:
             logger.info(f"Search from {interaction.user}: {query}")
@@ -205,7 +206,7 @@ class SierraClassHelper(commands.Cog):
                     courses = result["courses"]
 
                     if not courses:
-                        await interaction.followup.send("No courses found matching your search.", ephemeral=True)
+                        await interaction.followup.send("No courses found matching your search.", ephemeral=False)
                         return
 
                     # Format courses nicely
@@ -223,18 +224,18 @@ class SierraClassHelper(commands.Cog):
                         output += f"CRN: {crn} | Instructor: {instructor}\n\n"
 
                     if len(output) <= 2000:
-                        await interaction.followup.send(output, ephemeral=True)
+                        await interaction.followup.send(output, ephemeral=False)
                     else:
-                        await interaction.followup.send(output[:2000], ephemeral=True)
+                        await interaction.followup.send(output[:2000], ephemeral=False)
                 else:
-                    await interaction.followup.send("Failed to search courses. Please try again.", ephemeral=True)
+                    await interaction.followup.send("Failed to search courses. Please try again.", ephemeral=False)
 
         except Exception as e:
             logger.error(f"Error processing search: {e}")
             await interaction.followup.send(
                 "Sorry, I encountered an error processing your search. "
                 "Please try again later.",
-                ephemeral=True
+                ephemeral=False
             )
 
 @bot.event
@@ -261,61 +262,78 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    """Handle incoming messages"""
-    # Ignore messages from the bot itself
+    """Handle incoming messages.
+
+    Triggered when the bot is mentioned in a server channel OR when anyone
+    sends the bot a direct message. DMs don't require an @mention — the bot
+    is the only recipient, so every DM is treated as a query.
+    """
     if message.author == bot.user:
         return
 
-    # Check if bot is mentioned
-    if bot.user in message.mentions:
-        # Extract the message content without the mention
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    is_mention = bot.user in message.mentions
+
+    if not is_dm and not is_mention:
+        return
+
+    if is_dm:
+        content = message.content.strip()
+    else:
+        # Strip the @mention prefix so the model doesn't see "<@1234567> what classes..."
         content = message.content
         for mention in message.mentions:
-            content = content.replace(f'<@{mention.id}>', '').replace(f'<@!{mention.id}>', '')
+            content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
         content = content.strip()
 
-        # If there's content after the mention, treat it as a question
-        if content:
-            async with message.channel.typing():
-                try:
-                    logger.info(f"Mention from {message.author}: {content}")
-
-                    # Get the SierraClassHelper cog
-                    cog = bot.get_cog("SierraClassHelper")
-                    if cog:
-                        # Call the chat API with user ID
-                        result = await cog.call_chat_api(content, message.author.id)
-
-                        # Discord has a 2000 character limit
-                        response_text = result["response"]
-
-                        if len(response_text) <= 2000:
-                            await message.reply(response_text)
-                        else:
-                            # Split into chunks
-                            chunks = [response_text[i:i+2000] for i in range(0, len(response_text), 2000)]
-                            for chunk in chunks:
-                                await message.channel.send(chunk)
-
-                        logger.info(f"Response sent to {message.author}")
-                    else:
-                        await message.reply("Sorry, I'm having trouble processing your request right now.")
-
-                except RateLimited:
-                    await message.reply(RATE_LIMIT_MESSAGE)
-                except Exception as e:
-                    logger.error(f"Error processing mention: {e}")
-                    await message.reply(
-                        "Sorry, I encountered an error processing your question. "
-                        "Please try again later or use the `/ask` command."
-                    )
+    # Use channel.send in DMs (no message to "reply" to nicely) and reply in channels
+    async def respond(text: str) -> None:
+        if is_dm:
+            await message.channel.send(text)
         else:
-            # Just mentioned without a question
-            await message.reply(
-                "Hi! I'm Sierra Class Helper. Ask me about courses!\n\n"
-                "You can:\n"
-                "- Mention me with a question: `@SierraClassHelper What CS classes are available?`\n"
-                "- Use slash commands: `/ask <question>`, `/search <query>`, or `/clear`"
+            await message.reply(text)
+
+    if not content:
+        await respond(
+            "Hi! I'm Sierra Class Helper. Ask me about courses!\n\n"
+            "You can:\n"
+            "- DM me directly\n"
+            "- Mention me in a channel: `@SierraClassHelper What CS classes are available?`\n"
+            "- Use slash commands: `/ask <question>`, `/search <query>`, or `/clear`"
+        )
+        return
+
+    async with message.channel.typing():
+        try:
+            source = "DM" if is_dm else "mention"
+            logger.info(f"{source} from {message.author}: {content}")
+
+            cog = bot.get_cog("SierraClassHelper")
+            if not cog:
+                await respond("Sorry, I'm having trouble processing your request right now.")
+                return
+
+            result = await cog.call_chat_api(content, message.author.id)
+            response_text = result["response"]
+
+            if len(response_text) <= 2000:
+                await respond(response_text)
+            else:
+                chunks = [response_text[i:i + 2000] for i in range(0, len(response_text), 2000)]
+                # First chunk gets the "reply" affordance in channels; the rest stream in the channel
+                await respond(chunks[0])
+                for chunk in chunks[1:]:
+                    await message.channel.send(chunk)
+
+            logger.info(f"Response sent to {message.author}")
+
+        except RateLimited:
+            await respond(RATE_LIMIT_MESSAGE)
+        except Exception as e:
+            logger.error(f"Error processing {('DM' if is_dm else 'mention')}: {e}")
+            await respond(
+                "Sorry, I encountered an error processing your question. "
+                "Please try again later or use the `/ask` command."
             )
 
 async def main():

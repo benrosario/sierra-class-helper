@@ -102,38 +102,6 @@ class TestChatEndpoint:
 
 
 @requires_openai
-class TestExtractUserIntent:
-    """Tests for extract_user_intent function"""
-
-    def test_returns_structured_dict(self):
-        """Should return dict with expected keys"""
-        from src.api.server import extract_user_intent
-        intent = extract_user_intent("what coding classes are good for beginners")
-
-        assert isinstance(intent, dict)
-        assert "subject_area" in intent
-        assert "keywords_required" in intent
-        assert "keywords_exclude" in intent
-        assert "intent_summary" in intent
-
-    def test_detects_subject_area(self):
-        """Should detect subject area from query"""
-        from src.api.server import extract_user_intent
-        intent = extract_user_intent("I need a math class")
-
-        # Subject area should be detected (may be "Math" or "Mathematics")
-        assert intent.get("subject_area") is not None or intent.get("keywords_required")
-
-    def test_handles_complex_query(self):
-        """Should extract intent from complex queries"""
-        from src.api.server import extract_user_intent
-        intent = extract_user_intent("easy programming class for beginners, not too advanced")
-
-        assert "intent_summary" in intent
-        assert len(intent["intent_summary"]) > 0
-
-
-@requires_openai
 class TestDetectLanguage:
     """Tests for detect_language function"""
 

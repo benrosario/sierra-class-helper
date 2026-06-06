@@ -103,3 +103,20 @@ class TestLoadAllSemesters:
 
         courses = load_all_semesters(directory=str(data_dir))
         assert courses["33333"]["course"]["source_term"] == "summer2025"
+
+    def test_newest_file_per_term_wins(self, tmp_path):
+        """When a term has multiple files, only the newest should be loaded."""
+        import os
+        data_dir = tmp_path / "course_data"
+        data_dir.mkdir()
+
+        old = data_dir / "fall2026_2026-01-01_00-00-00.json"
+        new = data_dir / "fall2026_2026-06-01_00-00-00.json"
+        old.write_text(json.dumps({"111": {"course": {"CRN": "111", "courseTitle": "OLD"}}}))
+        new.write_text(json.dumps({"111": {"course": {"CRN": "111", "courseTitle": "NEW"}}}))
+        os.utime(old, (1000, 1000))
+        os.utime(new, (2000, 2000))
+
+        courses = load_all_semesters(directory=str(data_dir))
+        # Only the newer file's version of CRN 111 should survive.
+        assert courses["111"]["course"]["courseTitle"] == "NEW"

@@ -6,10 +6,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 import os
+import time
 import logging
 import aiohttp
 from typing import Optional
 from dotenv import load_dotenv
+
+from src.utils.course_formatting import informalName, summarize_meetings
+from src.utils.campus import get_campus
 
 # Load environment variables from .env file
 load_dotenv()
@@ -53,6 +57,111 @@ RATE_LIMIT_MESSAGE = (
     "Wait a moment and try again."
 )
 
+# Disclaimer to append to each message
+DISCLAIMER = "I'm an AI assistant and this info can be inaccurate! — Always verify information at [sierracollege.edu](<https://sierracollege.edu>)!"
+
+# Discord rejects messages longer than 2000 characters.
+DISCORD_LIMIT = 2000
+
+# How long a user's conversation context survives between messages, and how many
+# turns we keep. Both small on purpose — this is throwaway short-term memory.
+HISTORY_TTL = 30 * 60  # seconds
+MAX_HISTORY_PER_USER = 10
+
+
+def format_outgoing(text: str) -> list[str]:
+    """
+    Attach the disclaimer and split into Discord-sized (<=2000 char) chunks.
+
+    The disclaimer rides on the final chunk when it fits, otherwise it's sent as
+    its own trailing message — so every reply ends with it no matter how long the
+    body is.
+    """
+    footer = f"\n\n{DISCLAIMER}"
+    if len(text) + len(footer) <= DISCORD_LIMIT:
+        return [text + footer]
+
+    chunks = [text[i:i + DISCORD_LIMIT] for i in range(0, len(text), DISCORD_LIMIT)]
+    if len(chunks[-1]) + len(footer) <= DISCORD_LIMIT:
+        chunks[-1] += footer
+    else:
+        chunks.append(DISCLAIMER)
+    return chunks
+
+
+def _format_instructor(faculty: list, rating: str | None) -> str:
+    """First instructor's display name (+ RateMyProfessors rating if present), or 'TBA'."""
+    if not faculty:
+        return "TBA"
+    name = faculty[0].get("name") or "TBA"
+    display = informalName(name) if "," in name else name
+    if len(faculty) > 1:
+        display += f" (+{len(faculty) - 1} more)"
+    if rating:
+        display += f" — RateMyProfessors: {rating}"
+    return display
+
+
+def format_course_block(course: dict) -> str:
+    """
+    Render one course as a compact, scannable block for /search.
+
+    Pulls everything from the course dict plus the API-provided 'instructorRating'
+    — no LLM involved. Anything missing degrades to a 'TBA'/'?' rather than erroring.
+    Layout (one line each): course + title + CRN, instructor + rating, dates +
+    campus, meeting schedule, seats, waitlist.
+    """
+    subject = course.get("subject", "")
+    number = course.get("courseNumber", "")
+    title = course.get("courseTitle", "No title")
+    crn = course.get("CRN", "N/A")
+
+    instructor = _format_instructor(course.get("faculty") or [], course.get("instructorRating"))
+
+    meetings = course.get("meetings") or []
+    when = summarize_meetings(meetings)
+    if meetings:
+        start = meetings[0].get("startDate") or "TBA"
+        end = meetings[0].get("endDate") or "TBA"
+        campus = get_campus(meetings[0].get("building", ""))
+    else:
+        start, end, campus = "TBA", "TBA", "Unknown Campus"
+
+    enr = course.get("enrollment") or {}
+    seats = f"{enr.get('enrolled', '?')}/{enr.get('max', '?')}"
+    waitlist = f"{enr.get('waitCount', '?')}/{enr.get('waitCapacity', '?')}"
+
+    return (
+        f"📚 **{subject}{number}** | {title} | CRN: {crn}\n"
+        f"👤 {instructor}\n"
+        f"📅 {start} → {end}\n"
+        f"📍 {campus}\n"
+        f"🕒 {when}\n"
+        f"💺 Seats: {seats}\n"
+        f"📋 Waitlist: {waitlist}\n"
+    )
+
+
+async def _resolve_reference(message) -> str | None:
+    """
+    Return the text of the message this one is replying to, or None.
+
+    Discord usually hands us the referenced message already resolved; if not (it
+    fell out of the cache), we fetch it. Any failure — deleted message, missing
+    permission — just yields None so the caller proceeds without the context.
+    """
+    ref = message.reference
+    if ref is None:
+        return None
+    resolved = ref.resolved
+    if resolved is None and ref.message_id:
+        try:
+            resolved = await message.channel.fetch_message(ref.message_id)
+        except Exception:
+            return None
+    content = getattr(resolved, "content", None)
+    return content or None
+
 
 class RateLimited(Exception):
     """Raised when the upstream API returns HTTP 429."""
@@ -64,10 +173,10 @@ class SierraClassHelper(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
-        # Store conversation history per user: {user_id: [{role, content}, ...]}
+        # Short-term context per user: {user_id: [{role, content, ts}, ...]}.
+        # In-memory only — it resets on restart, which is fine for casual chat.
         self.conversation_history = {}
-        # Maximum messages to keep per user
-        self.max_history_per_user = 20
+        self.max_history_per_user = MAX_HISTORY_PER_USER
 
     async def cog_load(self):
         """Initialize HTTP session when cog loads"""
@@ -81,17 +190,27 @@ class SierraClassHelper(commands.Cog):
             logger.info("HTTP session closed")
 
     def get_user_history(self, user_id: int) -> list:
-        """Get conversation history for a user"""
-        if user_id not in self.conversation_history:
-            self.conversation_history[user_id] = []
-        return self.conversation_history[user_id]
+        """
+        Return the user's still-fresh history, dropping anything older than the
+        TTL. Pruning on read keeps the store self-cleaning with no timers.
+        """
+        history = self.conversation_history.get(user_id)
+        if history:
+            # Prune in place so the stored list object stays stable across calls.
+            cutoff = time.time() - HISTORY_TTL
+            history[:] = [entry for entry in history if entry["ts"] >= cutoff]
+        if not history:
+            # Everything expired (or there was nothing) — forget the user entirely.
+            self.conversation_history.pop(user_id, None)
+            return []
+        return history
 
     def add_to_history(self, user_id: int, role: str, content: str):
-        """Add a message to user's conversation history"""
-        history = self.get_user_history(user_id)
-        history.append({"role": role, "content": content})
+        """Append a turn (timestamped), pruning expired ones and capping the size."""
+        self.get_user_history(user_id)  # prune expired entries first
+        history = self.conversation_history.setdefault(user_id, [])
+        history.append({"role": role, "content": content, "ts": time.time()})
 
-        # Trim history if it gets too long
         if len(history) > self.max_history_per_user:
             self.conversation_history[user_id] = history[-self.max_history_per_user:]
 
@@ -104,17 +223,18 @@ class SierraClassHelper(commands.Cog):
     async def call_chat_api(self, message: str, user_id: int, num_courses: int = 3) -> dict:
         """Call the chat API endpoint with conversation history"""
         try:
-            # Get user's conversation history
-            history = self.get_user_history(user_id)
-
-            # Add user message to history
+            # Snapshot the prior turns (already TTL-pruned) before adding this
+            # message, and strip the internal 'ts' the API doesn't expect.
+            prior = [
+                {"role": entry["role"], "content": entry["content"]}
+                for entry in self.get_user_history(user_id)
+            ]
             self.add_to_history(user_id, "user", message)
 
-            # Prepare API request with history
             request_data = {
                 "message": message,
                 "num_courses": num_courses,
-                "conversation_history": history[:-1] if len(history) > 1 else None  # Exclude current message
+                "conversation_history": prior or None,
             }
 
             async with self.session.post(
@@ -143,6 +263,11 @@ class SierraClassHelper(commands.Cog):
             logger.error(f"Failed to call chat API: {e}")
             raise
 
+    async def _send_followup(self, interaction: discord.Interaction, text: str):
+        """Send a (deferred) slash-command reply, with the disclaimer + chunking."""
+        for chunk in format_outgoing(text):
+            await interaction.followup.send(chunk, ephemeral=False)
+
     @app_commands.command(name="ask", description="Ask Sierra Class Helper a question about courses")
     @app_commands.describe(question="Your question about Sierra College courses")
     async def ask_command(self, interaction: discord.Interaction, question: str):
@@ -154,39 +279,30 @@ class SierraClassHelper(commands.Cog):
 
             # Call the API with user ID for conversation tracking
             result = await self.call_chat_api(question, interaction.user.id)
-
-            # Discord has a 2000 character limit, so split if needed
-            response_text = result["response"]
-
-            if len(response_text) <= 2000:
-                await interaction.followup.send(response_text, ephemeral=False)
-            else:
-                # Split into chunks
-                chunks = [response_text[i:i+2000] for i in range(0, len(response_text), 2000)]
-                await interaction.followup.send(chunks[0], ephemeral=False)
-                for chunk in chunks[1:]:
-                    await interaction.followup.send(chunk, ephemeral=False)
+            await self._send_followup(interaction, result["response"])
 
             logger.info(f"Response sent to {interaction.user}")
 
         except RateLimited:
-            await interaction.followup.send(RATE_LIMIT_MESSAGE, ephemeral=False)
+            await self._send_followup(interaction, RATE_LIMIT_MESSAGE)
         except Exception as e:
             logger.error(f"Error processing question: {e}")
-            await interaction.followup.send(
+            await self._send_followup(
+                interaction,
                 "Sorry, I encountered an error processing your question. "
                 "Please try again later or contact support.",
-                ephemeral=False
             )
 
     @app_commands.command(name="clear", description="Clear your conversation history with the bot")
     async def clear_command(self, interaction: discord.Interaction):
         """Clear your conversation history with the bot"""
         self.clear_user_history(interaction.user.id)
-        await interaction.response.send_message(
-            "✅ Your conversation history has been cleared! I'll start fresh with your next message.",
-            ephemeral=False
+        chunks = format_outgoing(
+            "✅ Your conversation history has been cleared! I'll start fresh with your next message."
         )
+        await interaction.response.send_message(chunks[0], ephemeral=False)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk, ephemeral=False)
 
     @app_commands.command(name="search", description="Search for courses (raw data without AI formatting)")
     @app_commands.describe(query="Search query for courses")
@@ -206,36 +322,28 @@ class SierraClassHelper(commands.Cog):
                     courses = result["courses"]
 
                     if not courses:
-                        await interaction.followup.send("No courses found matching your search.", ephemeral=False)
+                        await self._send_followup(interaction, "❌ No courses found matching your search.")
                         return
 
-                    # Format courses nicely
-                    output = f"**Found {len(courses)} courses:**\n\n"
-                    for course in courses:
-                        crn = course.get("CRN", "N/A")
-                        subject = course.get("subject", "")
-                        number = course.get("courseNumber", "")
-                        title = course.get("courseTitle", "No title")
+                    output = f"**Found {len(courses)} course(s):**\n\n"
+                    output += "\n".join(format_course_block(course) for course in courses)
 
-                        faculty = course.get("faculty", [])
-                        instructor = faculty[0]["name"] if faculty else "No instructor"
+                    # Remember what we showed so a follow-up ("what time does it
+                    # meet?") has the courses in context. Store the clean text —
+                    # the disclaimer is presentation-only and added at send time.
+                    self.add_to_history(interaction.user.id, "user", f"Searched courses: {query}")
+                    self.add_to_history(interaction.user.id, "assistant", output)
 
-                        output += f"**{subject}{number}** - {title}\n"
-                        output += f"CRN: {crn} | Instructor: {instructor}\n\n"
-
-                    if len(output) <= 2000:
-                        await interaction.followup.send(output, ephemeral=False)
-                    else:
-                        await interaction.followup.send(output[:2000], ephemeral=False)
+                    await self._send_followup(interaction, output)
                 else:
-                    await interaction.followup.send("Failed to search courses. Please try again.", ephemeral=False)
+                    await self._send_followup(interaction, "Failed to search courses. Please try again.")
 
         except Exception as e:
             logger.error(f"Error processing search: {e}")
-            await interaction.followup.send(
+            await self._send_followup(
+                interaction,
                 "Sorry, I encountered an error processing your search. "
                 "Please try again later.",
-                ephemeral=False
             )
 
 @bot.event
@@ -286,22 +394,34 @@ async def on_message(message):
             content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
         content = content.strip()
 
-    # Use channel.send in DMs (no message to "reply" to nicely) and reply in channels
+    # Reply in channels (so the thread stays readable), plain send in DMs. Every
+    # reply gets the disclaimer + chunking via format_outgoing; the first chunk
+    # carries the "reply" affordance in channels, the rest stream after it.
     async def respond(text: str) -> None:
+        chunks = format_outgoing(text)
         if is_dm:
-            await message.channel.send(text)
+            await message.channel.send(chunks[0])
         else:
-            await message.reply(text)
+            await message.reply(chunks[0])
+        for chunk in chunks[1:]:
+            await message.channel.send(chunk)
 
     if not content:
         await respond(
             "Hi! I'm Sierra Class Helper. Ask me about courses!\n\n"
             "You can:\n"
             "- DM me directly\n"
-            "- Mention me in a channel: `@SierraClassHelper What CS classes are available?`\n"
-            "- Use slash commands: `/ask <question>`, `/search <query>`, or `/clear`"
+            "- Mention me in a channel: '@SierraClassHelper What CS classes are available?'\n"
+            "- Use slash commands: '/ask <question>', '/search <query>', or '/clear'"
         )
         return
+
+    # If this message is a reply to something, pull that message in as context so
+    # follow-ups like "what are the times?" know which courses we mean.
+    query = content
+    referenced = await _resolve_reference(message)
+    if referenced:
+        query = f'(Replying to an earlier message: "{referenced[:500]}")\n{content}'
 
     async with message.channel.typing():
         try:
@@ -313,17 +433,8 @@ async def on_message(message):
                 await respond("Sorry, I'm having trouble processing your request right now.")
                 return
 
-            result = await cog.call_chat_api(content, message.author.id)
-            response_text = result["response"]
-
-            if len(response_text) <= 2000:
-                await respond(response_text)
-            else:
-                chunks = [response_text[i:i + 2000] for i in range(0, len(response_text), 2000)]
-                # First chunk gets the "reply" affordance in channels; the rest stream in the channel
-                await respond(chunks[0])
-                for chunk in chunks[1:]:
-                    await message.channel.send(chunk)
+            result = await cog.call_chat_api(query, message.author.id)
+            await respond(result["response"])
 
             logger.info(f"Response sent to {message.author}")
 
@@ -333,7 +444,7 @@ async def on_message(message):
             logger.error(f"Error processing {('DM' if is_dm else 'mention')}: {e}")
             await respond(
                 "Sorry, I encountered an error processing your question. "
-                "Please try again later or use the `/ask` command."
+                "Please try again later or use the '/ask' command."
             )
 
 async def main():

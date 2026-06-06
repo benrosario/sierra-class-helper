@@ -55,7 +55,10 @@ def get_embeddings_batch(client: OpenAI, texts: list[str], model: str = "text-em
         2
     """
     try:
-        MAX_TOKENS_PER_BATCH = 250000  # Stay safely under 300k limit
+        # estimate_tokens (chars/4) undercounts dense course text — course codes,
+        # dates, and room labels tokenize denser than prose. Keep a wide margin
+        # under OpenAI's hard 300k-tokens-per-request cap so a batch never blows it.
+        MAX_TOKENS_PER_BATCH = 200000
         MAX_INPUTS_PER_BATCH = 2048    # OpenAI's input limit
 
         all_embeddings = []

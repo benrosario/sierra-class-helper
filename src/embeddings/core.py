@@ -2,6 +2,7 @@ import json
 import faiss
 import os
 import logging
+import math
 import numpy as np
 import re
 from pathlib import Path
@@ -13,6 +14,7 @@ from src.utils.campus import get_campus
 from src.utils.subject_mapping import SUBJECT_MAPPING
 from src.utils.course_loader import load_all_semesters
 from src.utils.paths import COURSES_INDEX, ID_TO_COURSE_JSON, ensure_dirs
+from src.utils.sanitize import unescape_html
 from src.utils.embedding_helpers import (
     estimate_tokens,
     get_embeddings_batch as get_embeddings_batch_helper,
@@ -59,7 +61,9 @@ if os.path.exists(index_file) and os.path.exists(metadata_file):
     logger.info("Loading existing FAISS index and metadata...")
     index = faiss.read_index(index_file)
     with open(metadata_file, "r", encoding="utf-8") as f:
-        id_to_course_list = json.load(f)
+        # Decode HTML entities ("&amp;" -> "&") so /search and /ask serve clean
+        # text without needing the data re-scraped.
+        id_to_course_list = unescape_html(json.load(f))
 else:
     logger.info("No saved index found. Creating embeddings...")
     # embedding vectors will be stored in index
@@ -130,14 +134,15 @@ def reload_index() -> None:
     Reassignment of module globals is atomic in Python — concurrent searches
     will see either the old index or the new one, never a mix.
     """
-    global index, id_to_course_list, VALID_SUBJECTS
+    global index, id_to_course_list, VALID_SUBJECTS, LEXICAL_INDEX
     logger.info("Reloading FAISS index and metadata from disk...")
     new_index = faiss.read_index(index_file)
     with open(metadata_file, "r", encoding="utf-8") as f:
-        new_metadata = json.load(f)
+        new_metadata = unescape_html(json.load(f))
     index = new_index
     id_to_course_list = new_metadata
     VALID_SUBJECTS = get_valid_subjects()
+    LEXICAL_INDEX = build_lexical_index(id_to_course_list)
     logger.info(f"Reload complete: {len(id_to_course_list)} courses, {len(VALID_SUBJECTS)} subjects")
 
 def normalize_course_query(query: str) -> str:
@@ -255,149 +260,309 @@ def detect_subject_preference(query: str) -> str | None:
     return None
 
 
-def _find_exact_course_matches(subject: str, course_number: str, id_to_course_list: list) -> list[dict]:
+# --- Exact course-code resolution -------------------------------------------
+
+def _pad_course_number(raw: str) -> str:
+    """Normalize a course number like "1b"/"205" to Banner's "0001B"/"0205" form."""
+    raw = raw.upper()
+    if raw and raw[-1].isalpha():
+        return raw[:-1].zfill(4) + raw[-1]
+    return raw.zfill(4)
+
+
+def resolve_course_code(query: str, valid_subjects: set | None = None) -> tuple:
     """
-    Find exact matches for a specific course code.
+    Resolve a query naming a specific course to (SUBJECT, padded_number), else
+    (None, None).
 
-    Args:
-        subject: Course subject code (e.g., "MATH", "CHEM")
-        course_number: Course number (e.g., "1A", "101")
-        id_to_course_list: List of all courses with metadata
-
-    Returns:
-        list[dict]: Courses that exactly match the subject and number
+    Two ways in:
+      1. A real subject code + number ("MATH 31", "PHYS205") via extract_course_code.
+      2. A natural subject word + an adjacent number ("physics 205") via
+         SUBJECT_MAPPING — this is what lets "physics 205" land on PHYS0205, which
+         the 2-4 letter code pattern alone can't see.
     """
-    exact_matches = []
-    logger.info(f"Exact course code detected: {subject} {course_number}")
+    if valid_subjects is None:
+        valid_subjects = VALID_SUBJECTS
 
-    for entry in id_to_course_list:
-        course = entry["course"]
-        if (course.get("subject") == subject and
-            course.get("courseNumber") == course_number):
-            exact_matches.append(course)
-            logger.info(f"Found exact match: {subject}{course_number} - {course.get('courseTitle')}")
+    subject, number = extract_course_code(query)
+    if subject and number:
+        return subject, number
 
-    return exact_matches
+    lowered = query.lower()
+    # Longest subject names first so "political science" beats "science", etc.
+    for word, code in sorted(SUBJECT_MAPPING.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if valid_subjects and code not in valid_subjects:
+            continue
+        match = re.search(rf'\b{re.escape(word)}\s*(\d{{1,4}}[a-z]?)\b', lowered)
+        if match:
+            return code, _pad_course_number(match.group(1))
+    return None, None
 
 
-def _perform_semantic_search(query: str, k: int, preferred_subject: str, exact_matches: list,
-                             subject: str, course_number: str, index, id_to_course_list: list) -> list[dict]:
+# --- Lexical (keyword) search channel ---------------------------------------
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+# Filler words that carry no course-identifying signal — dropped from both the
+# index and the query so they don't create spurious matches.
+_STOPWORDS = {
+    "the", "a", "an", "of", "and", "or", "for", "to", "in", "on", "at", "is",
+    "are", "be", "with", "about", "class", "classes", "course", "courses",
+    "section", "sections", "what", "which", "when", "where", "who", "i", "want",
+    "need", "looking", "take", "taking", "me", "my", "please", "show", "find",
+    "any", "available", "all", "some", "best", "good", "easy",
+}
+_TITLE_WEIGHT = 3.0
+_CODE_WEIGHT = 3.0
+_DESC_WEIGHT = 1.0
+# Prefix (abbreviation) matches count for less than exact matches, so a real word
+# match ("computer" == "computer") outweighs a coincidental prefix ("mat" ~ "math").
+_PREFIX_PENALTY = 0.6
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase word/number tokens, minus stopwords and 1-char noise."""
+    return [t for t in _TOKEN_RE.findall((text or "").lower())
+            if len(t) >= 2 and t not in _STOPWORDS]
+
+
+def build_lexical_index(entries: list[dict]) -> dict:
     """
-    Perform semantic search with subject filtering and preference scoring.
+    Build the in-memory keyword index used by the lexical search channel.
 
-    Args:
-        query: Normalized search query
-        k: Number of results needed
-        preferred_subject: Subject code to boost in results (e.g., "MATH")
-        exact_matches: List of exact matches to avoid duplicates
-        subject: Course subject from exact match (if any)
-        course_number: Course number from exact match (if any)
-        index: FAISS index for semantic search
-        id_to_course_list: List of all courses with metadata
+    Per course we gather weighted tokens from the title (weighted highest), the
+    code (subject + number, kept both zero-padded "0205" and bare "205"), and the
+    subject description. We also compute an IDF per token across the corpus so rare,
+    distinguishing words (e.g. "linear", in a couple of titles) count for far more
+    than common ones (e.g. "algebra"). Positions line up with `entries`.
 
-    Returns:
-        list[dict]: Semantically similar courses, subject-filtered and ranked
+    Returns {"docs": [ {token: weight}, ... ], "idf": {token: idf}}.
     """
+    docs: list[dict] = []
+    df: dict[str, int] = {}
+
+    for entry in entries:
+        course = entry.get("course", {})
+        weighted: dict[str, float] = {}
+
+        def add(text, weight):
+            for tok in _tokenize(text):
+                weighted[tok] = max(weighted.get(tok, 0.0), weight)
+
+        add(course.get("courseTitle", ""), _TITLE_WEIGHT)
+        add(course.get("subjectDescription", ""), _DESC_WEIGHT)
+
+        subject = (course.get("subject") or "").lower()
+        number = (course.get("courseNumber") or "").lower()
+        for code_tok in {subject, number, number.lstrip("0")}:
+            if code_tok:
+                weighted[code_tok] = max(weighted.get(code_tok, 0.0), _CODE_WEIGHT)
+
+        docs.append(weighted)
+        for tok in weighted:
+            df[tok] = df.get(tok, 0) + 1
+
+    n = max(len(entries), 1)
+    idf = {tok: math.log(1 + n / freq) for tok, freq in df.items()}
+    return {"docs": docs, "idf": idf}
+
+
+def _best_token_score(query_tok: str, doc: dict, idf: dict) -> float:
+    """
+    Best idf-weighted field score for one query token against a course's tokens.
+
+    A doc token matches the query token if equal, or (both >=3 chars) one is a
+    prefix of the other — so "algebra" matches the abbreviated title token "alg".
+    """
+    # Numbers (course numbers, years) must match exactly — prefix matching them
+    # turns "2026" into a match for course "202", which is never what's meant.
+    query_is_numeric = query_tok.isdigit()
+
+    best = 0.0
+    for doc_tok, field_weight in doc.items():
+        if doc_tok == query_tok:
+            factor = 1.0
+        elif (not query_is_numeric and not doc_tok.isdigit()
+              and len(query_tok) >= 3 and len(doc_tok) >= 3
+              and (doc_tok.startswith(query_tok) or query_tok.startswith(doc_tok))):
+            factor = _PREFIX_PENALTY
+        else:
+            continue
+        score = field_weight * idf.get(doc_tok, 0.0) * factor
+        if score > best:
+            best = score
+    return best
+
+
+def lexical_search(lexical_index: dict, query: str, m: int) -> list[tuple]:
+    """Rank courses by keyword overlap; return top-m (position, score), best first."""
+    query_tokens = _tokenize(query)
+    if not query_tokens:
+        return []
+
+    docs = lexical_index["docs"]
+    idf = lexical_index["idf"]
+
+    scored = []
+    for pos, doc in enumerate(docs):
+        if not doc:
+            continue
+        total = sum(_best_token_score(qt, doc, idf) for qt in query_tokens)
+        if total > 0:
+            scored.append((pos, total))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:m]
+
+
+# --- Hybrid fusion ----------------------------------------------------------
+
+def _vector_search_positions(query: str, m: int) -> list[int]:
+    """Top-m course positions from the FAISS (semantic) index."""
     query_emb = np.array([get_embedding(query)], dtype="float32")
-    _, indices = index.search(query_emb, k * 3)  # Get more results for filtering/reranking
-
-    # Collect candidates with subject-based scoring
-    candidates = []
-    for idx in indices[0]:
-        idx = int(idx)
-        course = id_to_course_list[idx]["course"]
-
-        # If we have exact matches, skip duplicates
-        if exact_matches:
-            course_code = f"{course.get('subject')}{course.get('courseNumber')}"
-            exact_code = f"{subject}{course_number}"
-            if course_code == exact_code:
-                continue  # Skip, already in exact_matches
-
-        # Calculate preference score
-        score = 0
-        if preferred_subject and course.get("subject") == preferred_subject:
-            score = 1  # Boost courses from preferred subject
-
-        candidates.append((course, score))
-
-    # Sort candidates: preferred subject first, then by semantic similarity (order from FAISS)
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    semantic_results = [course for course, _ in candidates[:k - len(exact_matches)]]
-
-    return semantic_results
+    _, indices = index.search(query_emb, m)
+    return [int(i) for i in indices[0] if i >= 0]
 
 
-def _combine_and_rank_results(exact_matches: list, semantic_results: list, k: int) -> list[dict]:
+def fuse_candidates(vector_positions: list, lexical_scored: list, preferred_subject,
+                    entries: list, k: int, seen_codes: set,
+                    vec_weight: float = 0.5, subject_bonus: float = 0.15) -> list[dict]:
     """
-    Combine exact matches and semantic search results.
+    Blend the vector and lexical channels into the top-k *distinct* courses.
 
-    Exact matches are prioritized first, followed by semantic results.
+    Unlike plain Reciprocal Rank Fusion (which is rank-only), this keeps the
+    lexical channel's *magnitude*: a query like "linear algebra" matches the rare
+    title word "linear" with a far higher keyword score than the common "algebra",
+    and that gap is what lets the right course beat one the embeddings prefer. So:
 
-    Args:
-        exact_matches: Courses that exactly match the query
-        semantic_results: Semantically similar courses
-        k: Maximum number of results to return
+        score(pos) = normalized_lexical_score        # 0..1, the precise signal
+                   + vec_weight / (1 + vector_rank)   # semantic, secondary
+                   + subject_bonus (if preferred subject)
 
-    Returns:
-        list[dict]: Combined and ranked course results
+    Results are de-duplicated by (subject, courseNumber) — `seen_codes` carries the
+    codes already pinned as exact matches — so a topic search returns distinct
+    courses rather than many sections of the same one.
     """
-    final_results = exact_matches + semantic_results
-    return final_results[:k]
+    scores: dict[int, float] = {}
+
+    # Lexical magnitude, normalized per query so the scale is comparable to vector.
+    if lexical_scored:
+        max_lex = max(score for _, score in lexical_scored) or 1.0
+        for pos, score in lexical_scored:
+            scores[pos] = scores.get(pos, 0.0) + score / max_lex
+
+    # Vector rank as a secondary, fast-decaying signal.
+    for rank, pos in enumerate(vector_positions):
+        scores[pos] = scores.get(pos, 0.0) + vec_weight / (1 + rank)
+
+    if preferred_subject:
+        for pos in scores:
+            if entries[pos]["course"].get("subject") == preferred_subject:
+                scores[pos] += subject_bonus
+
+    results: list[dict] = []
+    for pos in sorted(scores, key=lambda p: scores[p], reverse=True):
+        course = entries[pos]["course"]
+        code = (course.get("subject"), course.get("courseNumber"))
+        if code in seen_codes:
+            continue
+        seen_codes.add(code)
+        results.append(course)
+        if len(results) >= k:
+            break
+    return results
+
+
+def all_sections_for(courses: list, entries: list | None = None,
+                     others_limit: int | None = 1) -> list[dict]:
+    """
+    Expand a ranked list of courses into their sections, grouped by course.
+
+    `courses` is what search_courses returns — distinct courses (or, for an exact
+    match, a single representative). The **top** (best-matching) course is expanded
+    to *every* section, so a search for a class shows all of its sessions. The
+    remaining courses are capped at `others_limit` sections each (default 1) — they
+    are weaker, secondary matches, and a popular one (e.g. College Algebra with 24
+    sections) would otherwise flood the results. Pass `others_limit=None` to expand
+    every course fully. De-dups the input codes, so it's idempotent.
+    """
+    if entries is None:
+        entries = id_to_course_list
+
+    codes, seen = [], set()
+    for c in courses:
+        code = (c.get("subject"), c.get("courseNumber"))
+        if code not in seen:
+            seen.add(code)
+            codes.append(code)
+
+    sections: list[dict] = []
+    for rank, code in enumerate(codes):
+        matches = [
+            entry["course"] for entry in entries
+            if (entry["course"].get("subject"), entry["course"].get("courseNumber")) == code
+        ]
+        if rank == 0 or others_limit is None:
+            sections.extend(matches)
+        else:
+            sections.extend(matches[:others_limit])
+    return sections
+
+
+# Built once at startup; rebuilt by reload_index() after a data refresh.
+LEXICAL_INDEX = build_lexical_index(id_to_course_list)
+logger.info(f"Built lexical index over {len(LEXICAL_INDEX['docs'])} courses")
 
 
 def search_courses(query: str, k: int = 3, subject_hint: str = None) -> list[dict]:
     """
-    Search for courses using exact match + semantic similarity.
+    Hybrid course search returning up to `k` *distinct* courses.
 
-    If query contains a specific course code (e.g., "CHEM 1B"), we first try to find
-    exact matches, then fall back to semantic search if not enough results.
+    If the query names a specific course (e.g. "physics 205" -> PHYS0205), that one
+    course is returned. Otherwise the top `k` distinct courses come from a fusion of
+    semantic (vector) and lexical (keyword) retrieval — the lexical channel is what
+    catches distinctive-but-rare or abbreviated title terms (e.g. "linear algebra"
+    -> "Diff Equations/Linear Alg") that pure embeddings bury.
 
-    Args:
-        query: Natural language search query
-        k: Number of results to return
-        subject_hint: Optional subject area hint from intent extraction (e.g., "Music", "Computer Science")
-                     This overrides automatic subject detection for better accuracy.
-
-    Returns:
-        List of course dictionaries
+    Results are one representative per course; callers expand them to every section
+    with all_sections_for(). `subject_hint` (e.g. "Music") overrides automatic
+    subject detection for the preference boost.
     """
     try:
-        # Normalize the query to handle common course code patterns
         normalized_query = normalize_course_query(query)
+        subject, course_number = resolve_course_code(normalized_query)
 
-        # Try to extract exact course code
-        subject, course_number = extract_course_code(normalized_query)
-
-        # Detect subject preference - use hint if provided, otherwise auto-detect
+        # Subject preference for the fusion boost: explicit hint wins; otherwise a
+        # resolved code's subject, else auto-detect from the words.
         if subject_hint:
-            # Map subject hint to subject code (e.g., "Music" -> "MUS")
             preferred_subject = SUBJECT_MAPPING.get(subject_hint.lower())
             if preferred_subject:
                 logger.info(f"Using subject hint from intent: {subject_hint} -> {preferred_subject}")
             else:
                 logger.warning(f"Subject hint '{subject_hint}' not found in mapping")
+        elif subject:
+            preferred_subject = subject
         else:
-            preferred_subject = detect_subject_preference(normalized_query) if not subject else None
+            preferred_subject = detect_subject_preference(normalized_query)
 
-        # If we found a specific course code, try exact match first
-        exact_matches = []
+        # Exact course code -> return just that course (a representative section);
+        # all_sections_for() expands it to every section.
         if subject and course_number:
-            exact_matches = _find_exact_course_matches(subject, course_number, id_to_course_list)
+            for entry in id_to_course_list:
+                c = entry["course"]
+                if c.get("subject") == subject and c.get("courseNumber") == course_number:
+                    logger.info(f"Exact course code resolved: {subject} {course_number}")
+                    return [c]
+            logger.info(f"Resolved code {subject} {course_number} not offered; falling back to hybrid.")
 
-            # If we have enough exact matches, return those only (don't mix with semantic)
-            if exact_matches:
-                logger.info(f"Returning {len(exact_matches)} exact matches only (no semantic mixing)")
-                return exact_matches[:k]
+        # Hybrid: top-k distinct courses from blended vector + lexical retrieval.
+        m = max(k * 10, 50)
+        vector_positions = _vector_search_positions(normalized_query, m)
+        lexical_scored = lexical_search(LEXICAL_INDEX, normalized_query, m)
 
-        # Do semantic search (either as primary method or to supplement exact matches)
-        semantic_results = _perform_semantic_search(
-            normalized_query, k, preferred_subject, exact_matches,
-            subject, course_number, index, id_to_course_list
+        return fuse_candidates(
+            vector_positions, lexical_scored, preferred_subject,
+            id_to_course_list, k, set(),
         )
-
-        # Combine and rank results
-        return _combine_and_rank_results(exact_matches, semantic_results, k)
 
     except Exception as e:
         logger.error(f"Failed to search courses: {e}")

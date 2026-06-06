@@ -24,6 +24,7 @@ from typing import Optional
 from playwright.sync_api import Page, sync_playwright
 
 from src.utils.paths import COURSE_DATA_DIR, DEBUG_DIR
+from src.utils.sanitize import unescape_html
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +73,47 @@ def term_slug(description: str) -> str:
     return re.sub(r"[^a-z0-9]", "", description.lower())
 
 
+def prune_course_data(active_terms: list[dict]) -> None:
+    """
+    Trim course_data/ down to the latest snapshot of the currently-active terms.
+
+    For each term we keep only the newest file; older duplicate scrapes of the same
+    term are deleted, and so are files for terms no longer in the active set (a term
+    that has ended and dropped off Banner's list — e.g. last semester). This keeps
+    the index, once rebuilt, from surfacing classes that are over.
+
+    `active_terms` is what get_active_terms() returns ({"code", "description"}).
+    Call this only after a scrape with a valid, non-empty active set.
+    """
+    active_slugs = {term_slug(t["description"]) for t in active_terms}
+
+    files_by_term: dict[str, list[Path]] = {}
+    for f in COURSE_DATA_DIR.glob("*.json"):
+        slug = f.stem.split("_")[0] if "_" in f.stem else f.stem
+        files_by_term.setdefault(slug, []).append(f)
+
+    for slug, files in files_by_term.items():
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        # Keep the newest file for an active term; keep nothing for inactive terms.
+        keep = {files[0]} if slug in active_slugs else set()
+        for f in files:
+            if f in keep:
+                continue
+            try:
+                f.unlink()
+                logger.info(f"Pruned stale course_data file: {f.name}")
+            except OSError as e:
+                logger.warning(f"Could not delete {f.name}: {e}")
+
+
 def process_json(course):
     """
     Extract and format relevant fields from raw course API response.
+
+    The whole dict is run through unescape_html so HTML entities Banner ships in
+    text fields ("Math &amp; Technology Center") are decoded once, at the source.
     """
-    return {
+    return unescape_html({
         "term": course.get("termDesc"),
         "CRN": course.get("courseReferenceNumber"),
         "subject": course.get("subject"),
@@ -121,7 +158,7 @@ def process_json(course):
             for mt in [m.get("meetingTime", {})]
         ],
         "attributes": [a.get("description") for a in course.get("sectionAttributes", [])],
-    }
+    })
 
 
 def _dump_debug_artifacts(page: Page, term: str, label: str) -> None:

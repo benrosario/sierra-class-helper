@@ -133,8 +133,15 @@ def get_rating(faculty_name: str, path: str = DEFAULT_PATH) -> Optional[dict]:
 
 
 def format_rating(rating: dict) -> str:
-    """Render a rating record as a short inline string for LLM context."""
-    parts = [f"RMP: {rating['rating']:.1f}/5"] if rating.get("rating") else []
+    """
+    Render a rating record as a short inline metrics string, e.g.
+    "3.8/5, 27 ratings, 75% would take again".
+
+    No source label here — callers add their own ("RateMyProfessors: ...") so the
+    same metrics read cleanly under both the bot's /search line and the LLM
+    context block, which already names the source.
+    """
+    parts = [f"{rating['rating']:.1f}/5"] if rating.get("rating") else []
     if rating.get("num_ratings"):
         parts.append(f"{rating['num_ratings']} rating{'s' if rating['num_ratings'] != 1 else ''}")
     if rating.get("would_take_again_pct") is not None:

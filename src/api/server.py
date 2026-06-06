@@ -14,15 +14,18 @@ from openai import OpenAI
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+# Load environment variables from .env BEFORE importing local modules. Several
+# of them read env vars at import time — src.utils.paths reads SIERRA_DATA_DIR,
+# and src.embeddings.core requires OPENAI_API_KEY — so .env must be applied
+# first. On Railway these vars come from the service config and load_dotenv() is
+# a harmless no-op (it never overrides vars already present in the environment).
+from dotenv import load_dotenv
+load_dotenv()
+
 from src.api.analytics import get_stats, init_schema, record_message
 from src.api.scheduler import start_scheduler, stop_scheduler
-from src.embeddings.core import search_courses, course_to_text
-from src.utils.paths import ID_TO_COURSE_JSON
+from src.embeddings.core import search_courses, course_to_text, all_sections_for
 from src.utils.professor_ratings import get_rating, format_rating
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -95,14 +98,6 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     courses_searched: int
-
-# Function to get data freshness info (dynamically checks on each call)
-def get_data_last_updated():
-    """Get the last modified time of id_to_course.json"""
-    if ID_TO_COURSE_JSON.exists():
-        data_timestamp = ID_TO_COURSE_JSON.stat().st_mtime
-        return datetime.fromtimestamp(data_timestamp).strftime('%B %d, %Y at %I:%M %p')
-    return None
 
 def detect_language(text: str, conversation_history: list = None) -> tuple[str, str]:
     """
@@ -255,126 +250,6 @@ Your response (SAME or NEW):"""
         # On error, default to treating as new topic to avoid contamination
         return False
 
-def extract_user_intent(query: str) -> dict:
-    """
-    Extract structured intent from user query using LLM.
-
-    Returns a dictionary with:
-    - subject_area: Academic subject (e.g., "Computer Science", "Math")
-    - keywords_required: List of terms that must appear in course descriptions
-    - keywords_exclude: List of terms that disqualify courses
-    - intent_summary: Human-readable description of intent
-    """
-    try:
-        prompt = """Extract the academic intent from this course search query. Return ONLY valid JSON (no markdown, no code blocks).
-
-Return JSON in this exact format:
-{
-  "subject_area": "Computer Science" or "Math" or "English" or null if unclear,
-  "keywords_required": ["keyword1", "keyword2"],
-  "keywords_exclude": ["keyword1", "keyword2"],
-  "intent_summary": "Brief description of what the user wants",
-  "is_specific_course_title": true or false
-}
-
-CRITICAL GUIDELINES:
-- If the query mentions a specific course title (e.g., "History of Rock and Roll", "Introduction to Psychology", "Creative Writing"), set is_specific_course_title: true
-- For specific course titles, extract keywords from the FULL course title, not just individual words
-- For example, "History of Rock and Roll" should require ["rock", "roll", "music"] NOT ["history"] because it's a music course
-- keywords_required: Terms that MUST appear in relevant courses
-- keywords_exclude: Terms that indicate WRONG courses
-- Be generous with required keywords (synonyms and related terms)
-- Only exclude terms that are clearly opposite to intent
-
-Examples:
-Query: "what coding class is best for designers"
-{"subject_area": "Computer Science", "keywords_required": ["programming", "coding", "computer science", "software", "web programming"], "keywords_exclude": ["graphic design", "art", "illustration", "visual design"], "intent_summary": "Programming courses suitable for design students", "is_specific_course_title": false}
-
-Query: "History of Rock and Roll classes"
-{"subject_area": "Music", "keywords_required": ["rock", "roll", "music"], "keywords_exclude": ["u.s.", "american", "world history", "european"], "intent_summary": "Music course about rock and roll history", "is_specific_course_title": true}
-
-Query: "easy math class"
-{"subject_area": "Math", "keywords_required": ["math", "mathematics", "algebra", "statistics"], "keywords_exclude": ["calculus", "advanced", "honors"], "intent_summary": "Introductory or easier mathematics courses", "is_specific_course_title": false}
-
-Query: "Introduction to Psychology"
-{"subject_area": "Psychology", "keywords_required": ["psychology", "psych", "intro"], "keywords_exclude": [], "intent_summary": "Introductory psychology course", "is_specific_course_title": true}
-
-Now extract intent from this query:"""
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": query}
-            ],
-            temperature=0,
-            max_tokens=200
-        )
-
-        intent_json = response.choices[0].message.content.strip()
-
-        # Remove markdown code blocks if present
-        if intent_json.startswith("```"):
-            intent_json = intent_json.split("```")[1]
-            if intent_json.startswith("json"):
-                intent_json = intent_json[4:]
-            intent_json = intent_json.strip()
-
-        intent = json.loads(intent_json)
-        logger.info(f"Extracted intent: {intent}")
-        return intent
-    except Exception as e:
-        logger.error(f"Failed to extract intent: {e}")
-        # Return default intent on failure
-        return {
-            "subject_area": None,
-            "keywords_required": [],
-            "keywords_exclude": [],
-            "is_specific_course_title": False,
-            "intent_summary": "General course search"
-        }
-
-def validate_course_relevance(course: dict, intent: dict) -> bool:
-    """
-    Validate if a course matches the user's intent using LLM.
-
-    Returns True if relevant, False otherwise.
-    """
-    try:
-        # Quick check: if no intent requirements, accept all courses
-        if not intent.get("keywords_required") and not intent.get("intent_summary"):
-            return True
-
-        # Build course summary for validation
-        course_summary = f"{course.get('subjectDescription', '')} {course.get('subject', '')}{course.get('courseNumber', '')} - {course.get('courseTitle', '')}"
-
-        prompt = f"""Does this course match the user's intent?
-
-Intent: {intent.get('intent_summary', 'General course search')}
-
-Course: {course_summary}
-
-Reply with ONLY 'YES' or 'NO'."""
-
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a course relevance validator. Reply with only YES or NO."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=5
-        )
-
-        answer = response.choices[0].message.content.strip().upper()
-        is_relevant = answer == "YES"
-
-        logger.info(f"Course validation: {course_summary[:50]}... -> {answer}")
-        return is_relevant
-    except Exception as e:
-        logger.error(f"Failed to validate course relevance: {e}")
-        # On error, accept the course (fail open)
-        return True
 
 # System prompts for the chatbot
 def get_system_prompts():
@@ -389,7 +264,7 @@ def get_system_prompts():
         "IMPORTANT: When listing courses, ALWAYS show the full course name (e.g., 'College Algebra (MATH0012)') at the start of each course listing.",
         "IMPORTANT: ALWAYS include the CRN (Course Reference Number) for EVERY course you list. The CRN is critical information that students need to register. Example format: 'CRN: 12345' or include it prominently in the course listing.",
         "IMPORTANT: ALWAYS include the instructor's name for EVERY course you list. If multiple instructors, list all of them. If no instructor is assigned, clearly state 'Instructor: TBA' or 'No instructor assigned'.",
-        "When a course's context includes 'Instructor ratings (RateMyProfessors):', append the rating in parentheses right after the instructor's name (e.g., 'Instructor: Dan Groff (RMP: 3.8/5, 27 ratings, 75% would take again)'). If no rating data is provided for an instructor, simply omit it — do NOT say 'no rating available' or similar. Do not invent ratings.",
+        "When a course's context includes 'Instructor ratings (RateMyProfessors):', append the rating in parentheses right after the instructor's name (e.g., 'Instructor: Dan Groff (RateMyProfessors: 3.8/5, 27 ratings, 75% would take again)'). If no rating data is provided for an instructor, simply omit it — do NOT say 'no rating available' or similar. Do not invent ratings.",
         "IMPORTANT: ALWAYS show the campus location prominently for each course (e.g., 'Rocklin Campus', 'Nevada County Campus', 'Online', or 'Unknown Campus').",
         "IMPORTANT: You are being provided with the TOP matching courses based on semantic search. There may be many more courses available. Do NOT say these are the ONLY courses - say 'Here are the top matches' or 'Here are some relevant courses'.",
         "IMPORTANT: Count the courses carefully. If you receive 3 courses, say '3 courses', not '2 courses'.",
@@ -401,17 +276,9 @@ def get_system_prompts():
         "Make sure to give the building letter for classes, not just the building name. Make sure to append the building letter directly next to the room number, e.g. V303.",
     ]
 
-    # Add data freshness warning (dynamically check current timestamp)
-    data_last_updated = get_data_last_updated()
-    if data_last_updated:
-        prompts.append(
-            f"Data freshness: The course data was last updated on {data_last_updated}. "
-            f"IMPORTANT: At the VERY START of your response (before listing any courses), add this disclaimer with the :bangbang: emoji: "
-            f"':bangbang: **Showing [X] of potentially more courses.** Course data was last updated {data_last_updated}. "
-            f"Enrollment numbers and availability may have changed. For the most current information, visit the Sierra College website.' "
-            f"Replace [X] with the actual number of courses you are showing. Make this disclaimer prominent and eye-catching."
-        )
-
+    # NOTE: The "this is AI, verify on the official site" disclaimer is appended
+    # deterministically by the Discord bot on every outgoing message (see
+    # src/bot/bot.py), so it is intentionally NOT requested from the model here.
     return prompts
 
 @app.get("/")
@@ -455,11 +322,19 @@ async def search(request: CourseSearchRequest):
     """
     try:
         logger.info(f"Searching for: {request.query}")
-        results = search_courses(request.query, k=request.num_results)
+        # num_results is the number of distinct courses; expand each to all of its
+        # sections so students see every meeting time / instructor / CRN.
+        courses = search_courses(request.query, k=request.num_results)
+        sections = all_sections_for(courses)
+        # Attach each section's RateMyProfessors rating here. The bot formats the
+        # /search results itself, but it runs as a separate service without the
+        # ratings file, so the lookup has to happen on the API side.
+        for course in sections:
+            course["instructorRating"] = _primary_instructor_rating(course)
         return {
             "query": request.query,
-            "num_results": len(results),
-            "courses": results
+            "num_results": len(sections),
+            "courses": sections
         }
     except Exception as e:
         logger.error(f"Search failed: {e}")
@@ -557,7 +432,10 @@ Course data is updated regularly from Sierra College's course catalog. Check the
 Ask me about any courses at Sierra College!"""
 
     messages = [
-        {"role": "system", "content": identity_prompt}
+        {"role": "system", "content": identity_prompt},
+        # Anchor the model to the real date — without this, general questions like
+        # "what day is it?" get answered from the model's training cutoff.
+        {"role": "system", "content": f"Today's date is {datetime.now().strftime('%B %d, %Y')}."},
     ]
 
     # Add conversation history if provided
@@ -623,81 +501,20 @@ def _build_search_query(request: ChatRequest) -> str:
     return search_query
 
 
-def _filter_and_validate_courses(candidate_results: list[dict], intent: dict, num_courses: int) -> list[dict]:
+
+
+def _handle_no_results(request: ChatRequest) -> ChatResponse:
     """
-    Apply keyword filtering and LLM validation to course candidates.
-
-    First filters candidates using required/excluded keywords from intent,
-    then validates top candidates using LLM to ensure relevance.
-
-    Args:
-        candidate_results: List of candidate courses from semantic search
-        intent: Extracted user intent with keywords and subject area
-        num_courses: Number of courses requested
-
-    Returns:
-        list[dict]: Validated courses that match user intent
-    """
-    # Filter candidates using keywords from intent
-    filtered_results = []
-    keywords_required = [kw.lower() for kw in intent.get("keywords_required", [])]
-    keywords_exclude = [kw.lower() for kw in intent.get("keywords_exclude", [])]
-
-    for course in candidate_results:
-        # Convert course to text for keyword matching
-        course_text = course_to_text(course).lower()
-
-        # Check if course has required keywords (if any specified)
-        if keywords_required:
-            has_required = any(keyword in course_text for keyword in keywords_required)
-        else:
-            has_required = True  # No requirements, accept all
-
-        # Check if course has excluded keywords
-        has_excluded = any(keyword in course_text for keyword in keywords_exclude)
-
-        # Accept course if it has required keywords and no excluded keywords
-        if has_required and not has_excluded:
-            filtered_results.append(course)
-
-            # Stop once we have enough candidates for validation
-            if len(filtered_results) >= 10:
-                break
-
-    logger.info(f"Filtered {len(candidate_results)} candidates down to {len(filtered_results)} using keywords")
-
-    # If no results after keyword filtering, fallback to original candidates
-    if not filtered_results:
-        logger.warning("No results after keyword filtering, using original candidates")
-        filtered_results = candidate_results[:10]
-
-    # Validate filtered results using LLM (only validate top candidates to save cost)
-    validated_results = []
-    for course in filtered_results[:6]:  # Validate top 6 to get final 3
-        if validate_course_relevance(course, intent):
-            validated_results.append(course)
-
-        # Stop once we have enough results
-        if len(validated_results) >= num_courses:
-            break
-
-    return validated_results
-
-
-def _handle_no_results(request: ChatRequest, intent: dict) -> ChatResponse:
-    """
-    Generate response when no courses match the query.
+    Generate a response when the search returns nothing for a course query.
 
     Args:
         request: The chat request with user message and history
-        intent: Extracted user intent for explaining what was searched
 
     Returns:
-        ChatResponse informing user no matches were found
+        ChatResponse informing the user no matches were found
     """
-    logger.warning("No courses found matching user intent after validation and retry")
+    logger.warning("No courses found for query")
 
-    # Don't show rejected courses - instead inform user nothing matches
     lang_code, lang_name = detect_language(request.message, request.conversation_history)
 
     messages = [
@@ -711,7 +528,7 @@ def _handle_no_results(request: ChatRequest, intent: dict) -> ChatResponse:
 
     messages.append({
         "role": "user",
-        "content": f"User query (in {lang_name}): {request.message}\n\nNo courses were found matching this query. The search looked for courses related to '{intent.get('intent_summary', request.message)}' but could not find any matches.\n\nIMPORTANT: Respond in {lang_name}. Politely inform the user that no courses match their specific query, and suggest they try different search terms or ask about related subjects."
+        "content": f"User query (in {lang_name}): {request.message}\n\nNo courses were found matching this query.\n\nIMPORTANT: Respond in {lang_name}. Politely inform the user that no courses match their specific query, and suggest they try different search terms or ask about related subjects."
     })
 
     completion = openai_client.chat.completions.create(
@@ -723,6 +540,23 @@ def _handle_no_results(request: ChatRequest, intent: dict) -> ChatResponse:
         response=completion.choices[0].message.content,
         courses_searched=0
     )
+
+
+def _primary_instructor_rating(course: dict) -> str | None:
+    """
+    Return a short RMP rating string for a course's first instructor, or None.
+
+    Used to enrich /search results so the bot can show ratings without needing
+    the ratings file itself. Only the primary (first-listed) instructor is looked
+    up to keep the /search output compact.
+    """
+    faculty = course.get("faculty") or []
+    if not faculty:
+        return None
+    rating = get_rating(faculty[0].get("name", ""))
+    if not rating:
+        return None
+    return format_rating(rating) or None
 
 
 def _augment_with_ratings(course_text: str, course: dict) -> str:
@@ -814,44 +648,18 @@ async def chat(request: Request, body: ChatRequest):
         if not is_course_question:
             return _handle_non_course_question(body)
 
-        # For course-related questions, proceed with normal RAG pipeline
-        # Build enhanced search query with conversation context
+        # Course-related: build a context-aware query and trust hybrid search.
+        # (The old extract-intent -> keyword-filter -> LLM-validate gate was both a
+        # source of false "no results" and the bulk of the per-request LLM cost;
+        # hybrid retrieval in search_courses now does the relevance work.)
         search_query = _build_search_query(body)
+        top_courses = search_courses(search_query, k=body.num_courses)
+        results = all_sections_for(top_courses)  # every section of each top course
+        logger.info(f"Search returned {len(results)} sections across {len(top_courses)} courses")
 
-        # Extract user intent for intelligent filtering
-        intent = extract_user_intent(search_query)
-        logger.info(f"User intent: {intent['intent_summary']}")
-
-        # Search for MORE candidates (30 instead of 3) to allow filtering
-        # Pass subject area hint from intent to improve search accuracy
-        subject_hint = intent.get("subject_area")
-        candidate_results = search_courses(search_query, k=30, subject_hint=subject_hint)
-
-        # Filter and validate candidates
-        validated_results = _filter_and_validate_courses(candidate_results, intent, body.num_courses)
-
-        # If validation rejected all courses, retry search without subject hint
-        # This handles cases where LLM picked wrong subject (e.g., "Engineering" instead of "Mechatronics")
-        if not validated_results and subject_hint:
-            logger.warning(f"All courses rejected by validation. Subject hint '{subject_hint}' may be incorrect.")
-            logger.info("Retrying search without subject hint...")
-
-            # Retry search without subject bias
-            retry_candidates = search_courses(search_query, k=30, subject_hint=None)
-            validated_results = _filter_and_validate_courses(retry_candidates, intent, body.num_courses)
-
-            if validated_results:
-                logger.info(f"Retry successful: Found {len(validated_results)} courses without subject hint")
-
-        # Use validated results
-        results = validated_results if validated_results else []
-        logger.info(f"Final results after validation: {len(results)} courses")
-
-        # If still no results after retry, inform user
         if not results:
-            return _handle_no_results(body, intent)
+            return _handle_no_results(body)
 
-        # Generate final response with course data
         return _generate_course_response(body, results)
 
     except HTTPException:

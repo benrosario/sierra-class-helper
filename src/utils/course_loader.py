@@ -36,16 +36,27 @@ def load_all_semesters(directory=None):
     if directory is None:
         directory = COURSE_DATA_DIR
 
+    def term_of(json_file):
+        # "fall2025" from "fall2025_2025-11-26.json"
+        return json_file.stem.split('_')[0] if '_' in json_file.stem else json_file.stem
+
+    # A term can have several files if it's been scraped more than once. Keep only
+    # the newest file per term so a re-scrape deterministically supersedes the old
+    # one (otherwise glob order decides, and stale data can win).
+    newest_per_term = {}
     for json_file in Path(directory).glob("*.json"):
+        term = term_of(json_file)
+        current = newest_per_term.get(term)
+        if current is None or json_file.stat().st_mtime > current.stat().st_mtime:
+            newest_per_term[term] = json_file
+
+    for term, json_file in newest_per_term.items():
         with open(json_file, 'r') as f:
             data = json.load(f)
 
-            # Extract term from filename (e.g., "fall2025" from "fall2025_2025-11-26.json")
-            term = json_file.stem.split('_')[0] if '_' in json_file.stem else json_file.stem
-
-            for crn, course_data in data.items():
-                if 'course' in course_data:
-                    course_data['course']['source_term'] = term
-                all_courses[crn] = course_data
+        for crn, course_data in data.items():
+            if 'course' in course_data:
+                course_data['course']['source_term'] = term
+            all_courses[crn] = course_data
 
     return all_courses

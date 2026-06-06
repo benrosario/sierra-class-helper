@@ -24,7 +24,9 @@ class TestConversationHistory:
         assert history == []
 
     def test_get_user_history_returns_same_list(self, cog):
-        """Should return the same list for same user"""
+        """Should return the same (stable) list object for an active user"""
+        # An empty user is forgotten between calls, so seed one entry first.
+        cog.add_to_history(12345, "user", "hello")
         history1 = cog.get_user_history(12345)
         history2 = cog.get_user_history(12345)
         assert history1 is history2
@@ -43,15 +45,15 @@ class TestConversationHistory:
 
     def test_history_trimming(self, cog):
         """Should trim history when exceeding max_history_per_user"""
-        # Default is 20, add more than that
+        # Default is 10, add more than that
         for i in range(25):
             cog.add_to_history(12345, "user", f"Message {i}")
 
         history = cog.get_user_history(12345)
-        assert len(history) == 20
+        assert len(history) == 10
         # Should keep the most recent messages
         assert history[-1]["content"] == "Message 24"
-        assert history[0]["content"] == "Message 5"
+        assert history[0]["content"] == "Message 15"
 
     def test_clear_user_history(self, cog):
         """Should remove user's history"""
@@ -145,4 +147,39 @@ class TestCogInitialization:
         assert cog.bot is bot
         assert cog.session is None
         assert cog.conversation_history == {}
-        assert cog.max_history_per_user == 20
+        assert cog.max_history_per_user == 10
+
+
+class TestHistoryExpiry:
+    """Test the time-based expiry of conversation history."""
+
+    @pytest.fixture
+    def cog(self):
+        from src.bot.bot import SierraClassHelper
+        return SierraClassHelper(MagicMock())
+
+    def test_expired_entries_are_pruned_on_read(self, cog):
+        """Entries older than HISTORY_TTL should be dropped, fresh ones kept."""
+        import time
+        from src.bot.bot import HISTORY_TTL
+        cog.conversation_history[1] = [
+            {"role": "user", "content": "old", "ts": time.time() - HISTORY_TTL - 1},
+            {"role": "user", "content": "new", "ts": time.time()},
+        ]
+        history = cog.get_user_history(1)
+        assert [e["content"] for e in history] == ["new"]
+
+    def test_fully_expired_user_is_forgotten(self, cog):
+        """When every entry has expired, the user is removed from the store."""
+        import time
+        from src.bot.bot import HISTORY_TTL
+        cog.conversation_history[2] = [
+            {"role": "user", "content": "old", "ts": time.time() - HISTORY_TTL - 1},
+        ]
+        assert cog.get_user_history(2) == []
+        assert 2 not in cog.conversation_history
+
+    def test_entries_are_timestamped(self, cog):
+        """add_to_history should stamp each entry with a 'ts'."""
+        cog.add_to_history(3, "user", "hi")
+        assert "ts" in cog.conversation_history[3][0]

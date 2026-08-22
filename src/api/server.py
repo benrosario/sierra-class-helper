@@ -14,16 +14,10 @@ from openai import OpenAI
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-# Load environment variables from .env BEFORE importing local modules. Several
-# of them read env vars at import time — src.utils.paths reads SIERRA_DATA_DIR,
-# and src.embeddings.core requires OPENAI_API_KEY — so .env must be applied
-# first. On Railway these vars come from the service config and load_dotenv() is
-# a harmless no-op (it never overrides vars already present in the environment).
-from dotenv import load_dotenv
-load_dotenv()
-
+from src.config import Config
 from src.api.analytics import get_stats, init_schema, record_message
 from src.api.scheduler import start_scheduler, stop_scheduler
+from src.embeddings import core as embeddings_core
 from src.embeddings.core import search_courses, course_to_text, all_sections_for
 from src.utils.professor_ratings import get_rating, format_rating
 
@@ -47,9 +41,14 @@ limiter = Limiter(key_func=_rate_limit_key)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the in-process scheduler on app boot (gated by env var)."""
+    """
+    Boot-time setup: initialize the embeddings module (loads the FAISS + lexical
+    index, builds the OpenAI client) and analytics schema, then start the
+    background refresh scheduler when Config.ENABLE_SCHEDULER is set.
+    """
+    embeddings_core.initialize()
     init_schema()
-    if os.environ.get("SIERRA_ENABLE_SCHEDULER") == "1":
+    if Config.ENABLE_SCHEDULER:
         start_scheduler()
     else:
         logger.info("SIERRA_ENABLE_SCHEDULER not set; skipping background scheduler.")
@@ -78,8 +77,8 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-Discord-User"],
 )
 
-# Initialize OpenAI client
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+# Initialize OpenAI client for chat/classifier calls (embeddings live in src.embeddings.core)
+openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
 
 # Request/Response models
 class CourseSearchRequest(BaseModel):
@@ -156,7 +155,7 @@ If the text appears to be English with technical terms or abbreviations, reply w
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=Config.CHAT_MODEL,
             messages=[
                 {"role": "system", "content": "You are a language detection expert. Reply with only the language name."},
                 {"role": "user", "content": detection_prompt}
@@ -230,7 +229,7 @@ Examples:
 Your response (SAME or NEW):"""
 
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=Config.CHAT_MODEL,
             messages=[
                 {"role": "system", "content": "You are an expert at detecting conversation topic changes. Reply with only SAME or NEW."},
                 {"role": "user", "content": prompt}
@@ -295,7 +294,7 @@ async def health():
     """Detailed health check"""
     return {
         "status": "healthy",
-        "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
+        "openai_configured": bool(Config.OPENAI_API_KEY),
     }
 
 
@@ -306,9 +305,9 @@ async def admin_stats(token: str = ""):
     private. Set SIERRA_ADMIN_TOKEN in the api env and pass ?token=... when
     calling.
     """
-    expected = os.environ.get("SIERRA_ADMIN_TOKEN")
-    if not expected:
+    if not Config.ADMIN_TOKEN:
         raise HTTPException(status_code=503, detail="Stats endpoint not configured")
+    expected = Config.ADMIN_TOKEN
     if token != expected:
         raise HTTPException(status_code=403, detail="Invalid token")
     return get_stats()
@@ -367,7 +366,7 @@ Respond with ONLY "TRUE" or "FALSE"."""
 
     try:
         response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=Config.CHAT_MODEL,
             messages=[
                 {"role": "system", "content": classification_prompt},
                 {"role": "user", "content": f"Is this asking about courses/classes? '{message}'"}
@@ -451,7 +450,7 @@ Ask me about any courses at Sierra College!"""
     })
 
     completion = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=Config.CHAT_MODEL,
         messages=messages
     )
 
@@ -532,7 +531,7 @@ def _handle_no_results(request: ChatRequest) -> ChatResponse:
     })
 
     completion = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=Config.CHAT_MODEL,
         messages=messages
     )
 
@@ -614,7 +613,7 @@ def _generate_course_response(request: ChatRequest, results: list[dict]) -> Chat
     })
 
     completion = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=Config.CHAT_MODEL,
         messages=messages
     )
 
@@ -670,5 +669,4 @@ async def chat(request: Request, body: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=Config.PORT)

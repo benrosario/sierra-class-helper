@@ -17,10 +17,6 @@ class TestNormalizeCourseQuery:
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        """Import the function - requires OPENAI_API_KEY to import core module"""
-        import os
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY required to import embeddings.core")
         from src.embeddings.core import normalize_course_query
         self.normalize = normalize_course_query
 
@@ -57,62 +53,34 @@ class TestNormalizeCourseQuery:
 
 
 class TestExtractCourseCode:
-    """Test the extract_course_code function"""
+    """Test the extract_course_code function.
+
+    Passes an explicit valid_subjects set so these tests don't depend on the
+    module-level VALID_SUBJECTS (which is empty until initialize() runs).
+    """
+
+    VALID = {"MATH", "CHEM", "CSCI", "ENGL", "PHYS"}
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        """Import the function"""
-        import os
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY required to import embeddings.core")
-        from src.embeddings.core import extract_course_code, VALID_SUBJECTS
-        self.extract = extract_course_code
-        self.valid_subjects = VALID_SUBJECTS
+        from src.embeddings.core import extract_course_code
+        self.extract = lambda q: extract_course_code(q, valid_subjects=self.VALID)
 
     def test_extract_valid_math_code(self):
-        """Should extract MATH course codes"""
-        if "MATH" not in self.valid_subjects:
-            pytest.skip("MATH not in valid subjects")
-        subject, number = self.extract("MATH 31")
-        assert subject == "MATH"
-        assert number == "0031"
+        assert self.extract("MATH 31") == ("MATH", "0031")
 
     def test_extract_with_letter_suffix(self):
-        """Should handle letter suffixes like 1B"""
-        # Find a valid subject to test with
-        if "CHEM" in self.valid_subjects:
-            subject, number = self.extract("CHEM 1B")
-            assert subject == "CHEM"
-            assert number == "0001B"
-        elif "MATH" in self.valid_subjects:
-            subject, number = self.extract("MATH 1A")
-            if subject:  # Only assert if there's a 1A variant
-                assert number.endswith("A")
+        assert self.extract("CHEM 1B") == ("CHEM", "0001B")
 
     def test_extract_invalid_subject(self):
-        """Should return None for invalid subjects like CALC"""
-        subject, number = self.extract("CALC 2")
-        # CALC is not typically a valid subject code
-        if "CALC" not in self.valid_subjects:
-            assert subject is None
-            assert number is None
+        # CALC not in the whitelist — must be rejected even though the pattern matches.
+        assert self.extract("CALC 2") == (None, None)
 
     def test_extract_no_pattern(self):
-        """Should return None for queries without course codes"""
-        subject, number = self.extract("math classes for beginners")
-        assert subject is None
-        assert number is None
+        assert self.extract("math classes for beginners") == (None, None)
 
     def test_extract_normalizes_to_four_digits(self):
-        """Course numbers should be padded to 4 digits"""
-        # Use a subject we know is valid
-        for subj in ["CSCI", "MATH", "ENGL"]:
-            if subj in self.valid_subjects:
-                subject, number = self.extract(f"{subj} 10")
-                if subject:
-                    assert len(number) == 4
-                    assert number == "0010"
-                break
+        assert self.extract("CSCI 10") == ("CSCI", "0010")
 
 
 class TestDetectSubjectPreference:
@@ -120,10 +88,6 @@ class TestDetectSubjectPreference:
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        """Import the function"""
-        import os
-        if not os.environ.get("OPENAI_API_KEY"):
-            pytest.skip("OPENAI_API_KEY required to import embeddings.core")
         from src.embeddings.core import detect_subject_preference
         self.detect = detect_subject_preference
 

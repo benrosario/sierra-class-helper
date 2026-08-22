@@ -1,29 +1,29 @@
 """
-Single source of truth for every persistent-data file path in the project.
+Concrete Path objects for every persistent-data file.
 
-Why this exists: on Railway we attach a Volume to the api service mounted at
-`/data`, so the app's writable state survives container restarts. Locally
-during dev, the same files live at the repo root. Centralizing the paths
-behind one env var (SIERRA_DATA_DIR) keeps both environments using identical
-code paths — only the prefix changes.
+Config owns the filenames and the data-directory root; this module just glues
+them into pathlib.Path objects so existing callers can keep writing
+`from src.utils.paths import COURSES_INDEX` without change.
 
-Set SIERRA_DATA_DIR=/data in Railway env. Leave unset locally.
+On Railway the DATA_DIR is a mounted Volume (SIERRA_DATA_DIR=/data) so the
+files here survive container restarts. Locally it defaults to the repo root.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
-DATA_DIR = Path(os.environ.get("SIERRA_DATA_DIR", "."))
+from src.config import Config
 
-COURSES_INDEX = DATA_DIR / "courses.index"
-ID_TO_COURSE_JSON = DATA_DIR / "id_to_course.json"
-COURSE_DATA_DIR = DATA_DIR / "course_data"
-DEBUG_DIR = COURSE_DATA_DIR / "_debug"
-PROFESSOR_RATINGS_JSON = DATA_DIR / "professor_ratings.json"
-COURSE_HASHES_JSON = DATA_DIR / "course_hashes.json"
-COURSE_HASHES_NO_ENROLLMENT_JSON = DATA_DIR / "course_hashes_no_enrollment.json"
-ANALYTICS_DB = DATA_DIR / "analytics.sqlite"
+DATA_DIR: Path = Config.DATA_DIR
+
+COURSES_INDEX = DATA_DIR / Config.INDEX_FILE
+ID_TO_COURSE_JSON = DATA_DIR / Config.METADATA_FILE
+COURSE_DATA_DIR = DATA_DIR / Config.COURSE_DATA_DIRNAME
+DEBUG_DIR = COURSE_DATA_DIR / Config.DEBUG_DIRNAME
+PROFESSOR_RATINGS_JSON = DATA_DIR / Config.PROFESSOR_RATINGS_FILE
+COURSE_HASHES_JSON = DATA_DIR / Config.COURSE_HASHES_FILE
+COURSE_HASHES_NO_ENROLLMENT_JSON = DATA_DIR / Config.COURSE_HASHES_NO_ENROLLMENT_FILE
+ANALYTICS_DB = DATA_DIR / Config.ANALYTICS_DB_FILE
 
 
 def ensure_dirs() -> None:

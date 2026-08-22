@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-"""
-Backward compatibility wrapper for API server.
-Runs the server from src.api.server
-"""
+"""Entry point kept for deployment configs (Procfile, railway.toml, start_local.sh)."""
 if __name__ == "__main__":
-    from src.api.server import app
     import uvicorn
-    import os
-
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    from src.api.server import app
+    from src.config import Config
+    uvicorn.run(app, host="0.0.0.0", port=Config.PORT)

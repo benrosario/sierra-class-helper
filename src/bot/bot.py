@@ -5,40 +5,24 @@ Connects to the FastAPI backend to provide course search via Discord
 import discord
 from discord import app_commands
 from discord.ext import commands
-import os
 import time
 import logging
 import aiohttp
 from typing import Optional
-from dotenv import load_dotenv
 
+from src.config import Config
 from src.utils.course_formatting import informalName, summarize_meetings
 from src.utils.campus import get_campus
-
-# Load environment variables from .env file
-load_dotenv()
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
-ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
-API_URL = os.environ.get("API_URL")
-
-if not DISCORD_TOKEN:
+if not Config.DISCORD_BOT_TOKEN:
     raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
-
-if ENVIRONMENT == "production" and not API_URL:
-    raise ValueError(
-        "API_URL environment variable is required in production. "
-        "On Railway this should be set automatically to the api service's private domain."
-    )
-
-# Dev-only fallback
-if not API_URL:
-    API_URL = "http://localhost:8000"
+DISCORD_TOKEN = Config.DISCORD_BOT_TOKEN
+API_URL = Config.require_api_url()
 
 # Bot setup with intents
 intents = discord.Intents.default()

@@ -8,6 +8,8 @@ generating embeddings in batches.
 import logging
 from openai import OpenAI
 
+from src.config import Config
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,7 +32,7 @@ def estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
-def get_embeddings_batch(client: OpenAI, texts: list[str], model: str = "text-embedding-3-small") -> list[list[float]]:
+def get_embeddings_batch(client: OpenAI, texts: list[str], model: str | None = None) -> list[list[float]]:
     """
     Get embeddings for multiple texts using token-aware batching.
 
@@ -40,7 +42,7 @@ def get_embeddings_batch(client: OpenAI, texts: list[str], model: str = "text-em
     Args:
         client: OpenAI client instance
         texts: List of text strings to embed
-        model: Embedding model to use (default: text-embedding-3-small)
+        model: Embedding model to use (defaults to Config.EMBEDDING_MODEL)
 
     Returns:
         List of embedding vectors (one per input text)
@@ -54,6 +56,8 @@ def get_embeddings_batch(client: OpenAI, texts: list[str], model: str = "text-em
         >>> len(embeddings)
         2
     """
+    if model is None:
+        model = Config.EMBEDDING_MODEL
     try:
         # estimate_tokens (chars/4) undercounts dense course text — course codes,
         # dates, and room labels tokenize denser than prose. Keep a wide margin
@@ -113,14 +117,14 @@ def get_embeddings_batch(client: OpenAI, texts: list[str], model: str = "text-em
         raise
 
 
-def get_embedding(client: OpenAI, text: str, model: str = "text-embedding-3-small") -> list[float]:
+def get_embedding(client: OpenAI, text: str, model: str | None = None) -> list[float]:
     """
     Get embedding vector for a single text string.
 
     Args:
         client: OpenAI client instance
         text: Text string to embed
-        model: Embedding model to use (default: text-embedding-3-small)
+        model: Embedding model to use (defaults to Config.EMBEDDING_MODEL)
 
     Returns:
         Embedding vector as list of floats
@@ -134,6 +138,8 @@ def get_embedding(client: OpenAI, text: str, model: str = "text-embedding-3-smal
         >>> len(embedding)
         1536
     """
+    if model is None:
+        model = Config.EMBEDDING_MODEL
     try:
         response = client.embeddings.create(
             model=model,

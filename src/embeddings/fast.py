@@ -205,7 +205,7 @@ def fast_incremental_update():
 
     else:
         # No existing index - create from scratch
-        logger.info("No existing index found. Run embeddings_incremental.py first for initial setup.")
+        logger.info("No existing index found. Run 'python -m src.embeddings.incremental' first for initial setup.")
         return
 
     # Save everything

@@ -20,7 +20,7 @@ fi
 
 # Start API server in background
 echo "Starting API server on port 8000..."
-python api_server.py &
+python3 api_server.py &
 API_PID=$!
 
 # Wait for API to start
@@ -29,7 +29,7 @@ sleep 3
 # Start Discord bot
 echo "Starting Discord bot..."
 echo ""
-python discord_bot.py &
+python3 discord_bot.py &
 BOT_PID=$!
 
 echo ""

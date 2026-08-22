@@ -18,19 +18,36 @@ if [ ! -f courses.index ]; then
     exit 1
 fi
 
+# Confirm a backgrounded process is still alive after a brief wait, so an exec
+# failure (missing python, import error, uvicorn boot crash) surfaces here
+# instead of behind a misleading "now running!" banner. Kills any siblings on
+# failure so we never leave a half-started stack behind.
+check_alive() {
+    local name=$1 pid=$2
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "ERROR: $name (pid $pid) died on startup. Check the output above."
+        # Kill anything else we already started.
+        for other in "$@"; do
+            [ "$other" != "$name" ] && [ "$other" != "$pid" ] && kill "$other" 2>/dev/null
+        done
+        exit 1
+    fi
+}
+
 # Start API server in background
 echo "Starting API server on port 8000..."
 python3 api_server.py &
 API_PID=$!
-
-# Wait for API to start
 sleep 3
+check_alive "API server" "$API_PID"
 
 # Start Discord bot
 echo "Starting Discord bot..."
 echo ""
 python3 discord_bot.py &
 BOT_PID=$!
+sleep 2
+check_alive "Discord bot" "$BOT_PID" "$API_PID"
 
 echo ""
 echo "========================================="

@@ -13,6 +13,7 @@ from openai import OpenAI
 from datetime import datetime
 
 # Import shared utilities
+from src.config import Config
 from src.utils.course_formatting import informalName, meetingDays
 from src.utils.campus import get_campus
 from src.utils.course_loader import load_all_semesters
@@ -27,16 +28,22 @@ from src.utils.embedding_helpers import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Grab API key with validation
-api_key = os.environ.get("OPENAI_API_KEY")
-if not api_key:
-    raise ValueError("OPENAI_API_KEY environment variable is required")
-client = OpenAI(api_key=api_key)
-
-dimension = 1536
+dimension = Config.EMBEDDING_DIMENSION
 index_file = str(COURSES_INDEX)
 metadata_file = str(ID_TO_COURSE_JSON)
 hash_file = str(COURSE_HASHES_JSON)  # Track which courses have changed
+
+# OpenAI client built lazily on first use so `import` stays cheap and testable.
+_client: OpenAI | None = None
+
+
+def _get_client() -> OpenAI:
+    global _client
+    if _client is None:
+        if not Config.OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY environment variable is required")
+        _client = OpenAI(api_key=Config.OPENAI_API_KEY)
+    return _client
 
 def compute_course_hash(course_data):
     """Compute a hash of course data to detect changes"""
@@ -63,11 +70,11 @@ def course_to_text(course):
 
 def get_embedding(text: str) -> list[float]:
     """Get embedding for a single text using shared utility."""
-    return get_embedding_helper(client, text)
+    return get_embedding_helper(_get_client(), text)
 
 def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
     """Get embeddings in batches using shared utility."""
-    return get_embeddings_batch_helper(client, texts)
+    return get_embeddings_batch_helper(_get_client(), texts)
 
 def incremental_update():
     """Update embeddings incrementally"""

@@ -1,3 +1,13 @@
+"""
+Hybrid course search: exact-code resolution + FAISS vector search + IDF-weighted
+lexical search, fused into a single ranked list.
+
+Import is cheap and side-effect free — the OpenAI client, course data, FAISS
+index, and lexical index are only created when `initialize()` is called. Pure
+helpers (query normalization, `build_lexical_index`, `lexical_search`,
+`fuse_candidates`, `all_sections_for`) work without initialization; the API
+server (via its FastAPI lifespan) and the CLIs call `initialize()` at startup.
+"""
 import json
 import faiss
 import os
@@ -5,10 +15,9 @@ import logging
 import math
 import numpy as np
 import re
-from pathlib import Path
 from openai import OpenAI
 
-# Import shared utilities
+from src.config import Config
 from src.utils.course_formatting import informalName, meetingDays
 from src.utils.campus import get_campus
 from src.utils.subject_mapping import SUBJECT_MAPPING
@@ -16,112 +25,134 @@ from src.utils.course_loader import load_all_semesters
 from src.utils.paths import COURSES_INDEX, ID_TO_COURSE_JSON, ensure_dirs
 from src.utils.sanitize import unescape_html
 from src.utils.embedding_helpers import (
-    estimate_tokens,
     get_embeddings_batch as get_embeddings_batch_helper,
     get_embedding as get_embedding_helper,
-    course_to_text as course_to_text_helper
+    course_to_text as course_to_text_helper,
 )
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Grab API key with validation
-api_key = os.environ.get("OPENAI_API_KEY")
-if not api_key:
-    raise ValueError("OPENAI_API_KEY environment variable is required")
-client = OpenAI(api_key=api_key)
-
-dimension = 1536
+dimension = Config.EMBEDDING_DIMENSION
 index_file = str(COURSES_INDEX)
 metadata_file = str(ID_TO_COURSE_JSON)
 
-# Make sure the data directory exists before anything tries to write into it.
-ensure_dirs()
+# State populated by initialize(); left unset so `import` is cheap. reload_index()
+# may reassign these later. VALID_SUBJECTS starts empty so pure functions like
+# resolve_course_code (which falls back to SUBJECT_MAPPING) still work uninitialized.
+client: OpenAI | None = None
+courses: dict | None = None
+index = None
+id_to_course_list: list | None = None
+VALID_SUBJECTS: set = set()
+LEXICAL_INDEX: dict | None = None
 
-# Load all course data from all semesters
-courses = load_all_semesters()
+
+def initialize() -> None:
+    """
+    One-time heavy setup: build the OpenAI client, load course data, load or
+    build the FAISS index, then build the lexical index over it.
+
+    Idempotent — calling twice is a no-op. Callers that need to hit the vector
+    store or the OpenAI API (the API server, `src.embeddings.incremental`,
+    `src.embeddings.fast`) must call this at startup.
+    """
+    global client, courses, index, id_to_course_list, VALID_SUBJECTS, LEXICAL_INDEX
+    if client is not None:
+        return
+
+    if not Config.OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable is required")
+    client = OpenAI(api_key=Config.OPENAI_API_KEY)
+
+    ensure_dirs()
+    courses = load_all_semesters()
+
+    if os.path.exists(index_file) and os.path.exists(metadata_file):
+        logger.info("Loading existing FAISS index and metadata...")
+        index = faiss.read_index(index_file)
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            # Decode HTML entities ("&amp;" -> "&") so /search and /ask serve
+            # clean text without needing the data re-scraped.
+            id_to_course_list = unescape_html(json.load(f))
+    else:
+        logger.info("No saved index found. Creating embeddings...")
+        index = faiss.IndexFlatL2(dimension)
+        id_to_course_list = []
+
+        logger.info(f"Processing {len(courses)} courses...")
+        all_texts = []
+        all_entries = []
+        for crn, course in courses.items():
+            try:
+                all_texts.append(course_to_text(course))
+                all_entries.append({"crn": crn, "course": course})
+            except Exception as e:
+                logger.error(f"Failed to process course {crn}: {e}")
+                continue
+
+        logger.info("Generating embeddings in batches...")
+        embeddings = get_embeddings_batch(all_texts)
+
+        logger.info("Adding embeddings to FAISS index...")
+        for embedding, entry in zip(embeddings, all_entries):
+            vector = np.array([embedding], dtype="float32")
+            index.add(vector)
+            id_to_course_list.append(entry)
+
+        logger.info(f"Saving index with {len(id_to_course_list)} courses...")
+        faiss.write_index(index, index_file)
+        with open(metadata_file, "w", encoding="utf-8") as f:
+            json.dump(id_to_course_list, f, indent=2)
+
+    VALID_SUBJECTS = _extract_valid_subjects(id_to_course_list)
+    logger.info(f"Loaded {len(VALID_SUBJECTS)} valid subject codes")
+    LEXICAL_INDEX = build_lexical_index(id_to_course_list)
+    logger.info(f"Built lexical index over {len(LEXICAL_INDEX['docs'])} courses")
+
+
+def _require_initialized() -> None:
+    if index is None:
+        raise RuntimeError(
+            "src.embeddings.core.initialize() must be called before search_courses(). "
+            "The API server does this in its FastAPI lifespan; scripts should call it explicitly."
+        )
+
 
 # Wrapper function to convert course to text using utility
 def course_to_text(course):
     """Convert course to text using shared utility function."""
     return course_to_text_helper(course, informalName, meetingDays, get_campus)
 
+
 # Wrapper functions for embeddings to use the client
 def get_embedding(text: str) -> list[float]:
     """Get embedding for a single text using shared utility."""
+    if client is None:
+        initialize()
     return get_embedding_helper(client, text)
+
 
 def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
     """Get embeddings in batches using shared utility."""
+    if client is None:
+        initialize()
     return get_embeddings_batch_helper(client, texts)
 
-# Check if index + metadata already exist
-if os.path.exists(index_file) and os.path.exists(metadata_file):
-    logger.info("Loading existing FAISS index and metadata...")
-    index = faiss.read_index(index_file)
-    with open(metadata_file, "r", encoding="utf-8") as f:
-        # Decode HTML entities ("&amp;" -> "&") so /search and /ask serve clean
-        # text without needing the data re-scraped.
-        id_to_course_list = unescape_html(json.load(f))
-else:
-    logger.info("No saved index found. Creating embeddings...")
-    # embedding vectors will be stored in index
-    index = faiss.IndexFlatL2(dimension)
 
-    id_to_course_list = []  # each position in this list matches FAISS vector position
-
-    # Batch process all courses for efficiency
-    logger.info(f"Processing {len(courses)} courses...")
-    all_texts = []
-    all_entries = []
-
-    for crn, course in courses.items():
-        try:
-            # create string version of course
-            text = course_to_text(course)
-            all_texts.append(text)
-            all_entries.append({"crn": crn, "course": course})
-        except Exception as e:
-            logger.error(f"Failed to process course {crn}: {e}")
-            continue
-
-    # Get all embeddings in token-aware batches
-    logger.info("Generating embeddings in batches...")
-    embeddings = get_embeddings_batch(all_texts)
-
-    # Add all embeddings to FAISS index
-    logger.info("Adding embeddings to FAISS index...")
-    for embedding, entry in zip(embeddings, all_entries):
-        vector = np.array([embedding], dtype="float32")
-        index.add(vector)
-        id_to_course_list.append(entry)
-
-    # Save FAISS index and metadata
-    logger.info(f"Saving index with {len(id_to_course_list)} courses...")
-    faiss.write_index(index, index_file)
-    with open(metadata_file, "w", encoding="utf-8") as f:
-        json.dump(id_to_course_list, f, indent=2)
-
-# Extract valid subject codes from loaded course data
-def get_valid_subjects() -> set:
-    """
-    Extract all unique subject codes from the loaded course data.
-
-    Returns:
-        Set of valid subject codes (e.g., {'MATH', 'CSCI', 'ENGL', ...})
-    """
-    subjects = set()
-    for entry in id_to_course_list:
-        course = entry.get("course", {})
-        subject = course.get("subject", "")
+def _extract_valid_subjects(entries: list) -> set:
+    """Set of all subject codes present in the loaded course data."""
+    subjects: set = set()
+    for entry in entries or []:
+        subject = entry.get("course", {}).get("subject", "")
         if subject:
             subjects.add(subject)
     return subjects
 
-# Initialize valid subjects cache (computed once at startup)
-VALID_SUBJECTS = get_valid_subjects()
-logger.info(f"Loaded {len(VALID_SUBJECTS)} valid subject codes")
+
+def get_valid_subjects() -> set:
+    """Backward-compat alias — reads the current VALID_SUBJECTS set."""
+    return set(VALID_SUBJECTS)
 
 
 def reload_index() -> None:
@@ -141,7 +172,7 @@ def reload_index() -> None:
         new_metadata = unescape_html(json.load(f))
     index = new_index
     id_to_course_list = new_metadata
-    VALID_SUBJECTS = get_valid_subjects()
+    VALID_SUBJECTS = _extract_valid_subjects(id_to_course_list)
     LEXICAL_INDEX = build_lexical_index(id_to_course_list)
     logger.info(f"Reload complete: {len(id_to_course_list)} courses, {len(VALID_SUBJECTS)} subjects")
 
@@ -169,10 +200,13 @@ def normalize_course_query(query: str) -> str:
     logger.info(f"Query normalized: '{query}' -> '{normalized}'")
     return normalized
 
-def extract_course_code(query: str) -> tuple[str, str]:
+def extract_course_code(query: str, valid_subjects: set | None = None) -> tuple[str, str]:
     """
     Extract subject and course number from query, validating against real subject codes.
     Returns (subject, course_number) or (None, None) if not found or invalid.
+
+    Pass `valid_subjects` explicitly to avoid depending on module-level state
+    (useful in tests). Defaults to the initialized VALID_SUBJECTS set.
 
     Examples:
     - "CHEM 1B" -> ("CHEM", "0001B")  # CHEM is valid
@@ -180,8 +214,9 @@ def extract_course_code(query: str) -> tuple[str, str]:
     - "CALC 2" -> (None, None)        # CALC is not a valid subject code
     - "math classes" -> (None, None)  # No pattern match
     """
+    subjects_to_check = valid_subjects if valid_subjects is not None else VALID_SUBJECTS
+
     # Pattern: Subject (2-4 letters) followed by course number (1-4 digits + optional letter)
-    import re
     pattern = r'\b([A-Z]{2,4})\s*(\d{1,4}[A-Z]?)\b'
     match = re.search(pattern, query.upper())
 
@@ -190,7 +225,7 @@ def extract_course_code(query: str) -> tuple[str, str]:
         number = match.group(2)
 
         # Validate subject code against actual course subjects
-        if subject not in VALID_SUBJECTS:
+        if subject not in subjects_to_check:
             logger.info(f"Rejected course code '{subject} {number}' - '{subject}' is not a valid subject code")
             return (None, None)
 
@@ -284,7 +319,7 @@ def resolve_course_code(query: str, valid_subjects: set | None = None) -> tuple:
     if valid_subjects is None:
         valid_subjects = VALID_SUBJECTS
 
-    subject, number = extract_course_code(query)
+    subject, number = extract_course_code(query, valid_subjects=valid_subjects)
     if subject and number:
         return subject, number
 
@@ -508,11 +543,6 @@ def all_sections_for(courses: list, entries: list | None = None,
     return sections
 
 
-# Built once at startup; rebuilt by reload_index() after a data refresh.
-LEXICAL_INDEX = build_lexical_index(id_to_course_list)
-logger.info(f"Built lexical index over {len(LEXICAL_INDEX['docs'])} courses")
-
-
 def search_courses(query: str, k: int = 3, subject_hint: str = None) -> list[dict]:
     """
     Hybrid course search returning up to `k` *distinct* courses.
@@ -527,6 +557,7 @@ def search_courses(query: str, k: int = 3, subject_hint: str = None) -> list[dic
     with all_sections_for(). `subject_hint` (e.g. "Music") overrides automatic
     subject detection for the preference boost.
     """
+    _require_initialized()
     try:
         normalized_query = normalize_course_query(query)
         subject, course_number = resolve_course_code(normalized_query)

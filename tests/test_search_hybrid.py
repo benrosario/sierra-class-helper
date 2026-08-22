@@ -2,24 +2,28 @@
 Unit tests for the hybrid search building blocks in src/embeddings/core.py:
 exact course-code resolution, the lexical (keyword) channel, and RRF fusion.
 
-Importing core requires OPENAI_API_KEY (it builds an OpenAI client at import), so
-these load .env and skip if no key is configured. The functions themselves make
-no network calls.
+Importing core is side-effect free — none of these tests need an OpenAI key or
+a built FAISS index.
 """
-import os
-
 import pytest
-from dotenv import load_dotenv
 
-load_dotenv()
+from src.embeddings import core as _core
 
 
 @pytest.fixture
 def core():
-    if not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip("OPENAI_API_KEY required to import embeddings.core")
-    from src.embeddings import core as c
-    return c
+    """
+    Yield the core module with a small, deterministic VALID_SUBJECTS set so
+    exact-code resolution works without initialize() (which would need a real
+    OpenAI key + FAISS index). Restored to whatever was there before after each
+    test — usually the empty default, but be explicit.
+    """
+    original = _core.VALID_SUBJECTS
+    _core.VALID_SUBJECTS = {"MATH", "PHYS", "CHEM", "CSCI", "BIOL", "BUS", "ENGL"}
+    try:
+        yield _core
+    finally:
+        _core.VALID_SUBJECTS = original
 
 
 def _entry(subject, number, title, desc="Mathematics"):

@@ -33,3 +33,14 @@ logs/
 build/
 dist/
 *.egg-info/
+
+# Generated data. In production these live on the Railway volume (SIERRA_DATA_DIR);
+# locally they land at the repo root. None of it belongs in git — the scraper +
+# embedding jobs regenerate it. See the cold-start steps in the README.
+courses.index
+id_to_course.json
+professor_ratings.json
+course_hashes.json
+course_hashes_no_enrollment.json
+analytics.sqlite
+course_data/

@@ -280,10 +280,6 @@ Set the `DISCORD_BOT_TOKEN` in your `.env` file. Get it from [Discord Developer 
 ### Embeddings taking too long
 The first run creates embeddings for all courses, which can take a few minutes. Subsequent runs load from the saved index file.
 
-## License
-
-Created by Ben Rosario for Sierra College students.
-
 ## Support
 
-For issues or questions, contact Ben Rosario.
+For issues or questions, contact benrosario@berkeley.edu.

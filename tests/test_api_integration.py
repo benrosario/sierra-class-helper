@@ -101,94 +101,42 @@ class TestChatEndpoint:
         assert "response" in data
 
 
-@requires_openai
-class TestDetectLanguage:
-    """Tests for detect_language function"""
-
-    def test_detect_english(self):
-        """Should detect English text"""
-        from src.api.server import detect_language
-        code, name = detect_language("What classes are available?")
-        assert code == "en"
-        assert name == "English"
-
-    def test_detect_spanish(self):
-        """Should detect Spanish text"""
-        from src.api.server import detect_language
-        code, name = detect_language("Que clases hay disponibles?")
-        assert code == "es"
-        assert name == "Spanish"
-
-    def test_returns_tuple(self):
-        """Should return (code, name) tuple"""
-        from src.api.server import detect_language
-        result = detect_language("Hello")
-        assert isinstance(result, tuple)
-        assert len(result) == 2
+# NOTE: TestDetectLanguage / TestIsCourseRelatedQuestion /
+# TestDetectTopicContinuation removed intentionally — those three LLM-backed
+# classifiers were folded into the main /chat response prompt so every request
+# is one model call instead of four. Language handling, identity-vs-course
+# gating, and topic-continuation now live in `get_system_prompts()` instead.
 
 
-@requires_openai
-class TestIsCourseRelatedQuestion:
-    """Tests for is_course_related_question function"""
+class TestBuildSearchQuery:
+    """Unit tests for _build_search_query — no LLM, purely deterministic."""
 
-    def test_course_question_true(self):
-        """Should return True for course-related questions"""
-        from src.api.server import is_course_related_question
-        result = is_course_related_question("What math classes are offered?")
-        assert result is True
+    def test_no_history_returns_current_message(self):
+        from src.api.server import _build_search_query, ChatRequest
+        req = ChatRequest(message="physics 205", conversation_history=None)
+        assert _build_search_query(req) == "physics 205"
 
-    def test_identity_question_false(self):
-        """Should return False for identity questions"""
-        from src.api.server import is_course_related_question
-        result = is_course_related_question("Who are you?")
-        assert result is False
+    def test_prepends_recent_user_messages_for_followup(self):
+        from src.api.server import _build_search_query, ChatRequest, ConversationMessage
+        req = ChatRequest(
+            message="what about summer?",
+            conversation_history=[
+                ConversationMessage(role="user", content="show me math classes"),
+                ConversationMessage(role="assistant", content="Here are..."),
+            ],
+        )
+        # The current message alone is uninterpretable; prior user turn is kept.
+        assert _build_search_query(req) == "show me math classes what about summer?"
 
-    def test_greeting_false(self):
-        """Should return False for greetings"""
-        from src.api.server import is_course_related_question
-        result = is_course_related_question("Hello")
-        assert result is False
-
-    def test_specific_course_true(self):
-        """Should return True for specific course queries"""
-        from src.api.server import is_course_related_question
-        result = is_course_related_question("When does MATH 10 meet?")
-        assert result is True
-
-
-@requires_openai
-class TestDetectTopicContinuation:
-    """Tests for detect_topic_continuation function"""
-
-    def test_same_topic_followup(self):
-        """Should detect follow-up questions as same topic"""
-        from src.api.server import detect_topic_continuation, ConversationMessage
-        history = [
-            ConversationMessage(role="user", content="What CS classes are available?")
-        ]
-        result = detect_topic_continuation("Which one teaches Python?", history)
-        assert result is True
-
-    def test_new_topic_different_subject(self):
-        """Should detect topic change when switching subjects"""
-        from src.api.server import detect_topic_continuation, ConversationMessage
-        history = [
-            ConversationMessage(role="user", content="What CS classes are available?")
-        ]
-        result = detect_topic_continuation("Show me biology courses", history)
-        assert result is False
-
-    def test_empty_history(self):
-        """Should return False for empty history"""
-        from src.api.server import detect_topic_continuation
-        result = detect_topic_continuation("Any question", [])
-        assert result is False
-
-    def test_none_history(self):
-        """Should handle None history gracefully"""
-        from src.api.server import detect_topic_continuation
-        result = detect_topic_continuation("Any question", None)
-        assert result is False
+    def test_ignores_assistant_turns(self):
+        from src.api.server import _build_search_query, ChatRequest, ConversationMessage
+        req = ChatRequest(
+            message="tell me more",
+            conversation_history=[
+                ConversationMessage(role="assistant", content="I found 3 courses..."),
+            ],
+        )
+        assert _build_search_query(req) == "tell me more"
 
 
 @requires_openai

@@ -77,8 +77,19 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-Discord-User"],
 )
 
-# Initialize OpenAI client for chat/classifier calls (embeddings live in src.embeddings.core)
-openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
+# OpenAI client for chat calls (embeddings live in src.embeddings.core). Built
+# lazily on first use so the module imports cleanly in tests that don't hit
+# the API — matches the pattern in src.embeddings.core.
+_openai_client: OpenAI | None = None
+
+
+def _get_openai_client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        if not Config.OPENAI_API_KEY:
+            raise ValueError("OPENAI_API_KEY environment variable is required")
+        _openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
+    return _openai_client
 
 # Request/Response models
 class CourseSearchRequest(BaseModel):
@@ -98,168 +109,30 @@ class ChatResponse(BaseModel):
     response: str
     courses_searched: int
 
-def detect_language(text: str, conversation_history: list = None) -> tuple[str, str]:
-    """
-    Detect the language of the input text.
-
-    Args:
-        text: The user's current message
-        conversation_history: Optional list of previous conversation messages to establish context
-
-    Returns:
-        tuple: (language_code, language_name)
-        e.g., ('en', 'English'), ('es', 'Spanish'), ('uk', 'Ukrainian')
-    """
-    # Language code to name mapping
-    language_names = {
-        'en': 'English',
-        'es': 'Spanish',
-        'fr': 'French',
-        'de': 'German',
-        'it': 'Italian',
-        'pt': 'Portuguese',
-        'ru': 'Russian',
-        'uk': 'Ukrainian',
-        'zh-cn': 'Chinese (Simplified)',
-        'zh-tw': 'Chinese (Traditional)',
-        'ja': 'Japanese',
-        'ko': 'Korean',
-        'ar': 'Arabic',
-        'hi': 'Hindi',
-        'vi': 'Vietnamese',
-        'th': 'Thai',
-        'pl': 'Polish',
-        'nl': 'Dutch',
-        'tr': 'Turkish',
-        'sv': 'Swedish',
-        'da': 'Danish',
-        'no': 'Norwegian',
-        'fi': 'Finnish',
-        'cs': 'Czech',
-        'ro': 'Romanian',
-        'el': 'Greek',
-        'he': 'Hebrew',
-        'id': 'Indonesian',
-        'ms': 'Malay',
-        'tl': 'Tagalog',
-    }
-
-    # Always use LLM for language detection on every query
-    # This allows users to switch languages mid-conversation and handles all edge cases
-    detection_prompt = f"""What language is this text written in?
-Text: "{text}"
-
-Reply with ONLY the language name from this list: English, Spanish, French, German, Italian, Portuguese, Russian, Ukrainian, Chinese, Japanese, Korean, Arabic, Hindi, Vietnamese, Thai, Polish, Dutch, Turkish, Swedish, Danish, Norwegian, Finnish, Czech, Romanian, Greek, Hebrew, Indonesian, Malay, Tagalog.
-
-If the text appears to be English with technical terms or abbreviations, reply with "English"."""
-
-    try:
-        response = openai_client.chat.completions.create(
-            model=Config.CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a language detection expert. Reply with only the language name."},
-                {"role": "user", "content": detection_prompt}
-            ],
-            temperature=0,
-            max_tokens=10
-        )
-
-        detected_lang_name = response.choices[0].message.content.strip()
-
-        # Map language name back to code
-        name_to_code = {v: k for k, v in language_names.items()}
-        llm_lang_code = name_to_code.get(detected_lang_name, 'en')
-
-        logger.info(f"LLM language detection: '{text}' -> {detected_lang_name} ({llm_lang_code})")
-
-        lang_name = language_names.get(llm_lang_code, detected_lang_name)
-        return (llm_lang_code, lang_name)
-    except Exception as e:
-        logger.error(f"Failed to detect language with LLM: {e}")
-        # On error, default to English
-        return ('en', 'English')
-
-def detect_topic_continuation(current_message: str, conversation_history: list) -> bool:
-    """
-    Intelligently detect if the current message is a continuation of the previous topic
-    or if it's a new, unrelated question.
-
-    Args:
-        current_message: The user's current message
-        conversation_history: List of previous conversation messages
-
-    Returns:
-        bool: True if same topic (use context), False if new topic (ignore context)
-    """
-    if not conversation_history or len(conversation_history) == 0:
-        return False
-
-    # Get the last few user messages for context
-    recent_user_messages = [
-        msg.content for msg in conversation_history[-3:]
-        if msg.role == "user"
-    ]
-
-    if not recent_user_messages:
-        return False
-
-    # Combine recent messages
-    previous_context = " | ".join(recent_user_messages)
-
-    try:
-        prompt = f"""Determine if the new message is a continuation of the previous conversation topic or a completely new topic.
-
-Previous conversation:
-{previous_context}
-
-New message:
-{current_message}
-
-Respond with ONLY "SAME" if the new message is asking about the same general topic/subject area as the previous conversation (e.g., follow-up questions, asking about different semesters of the same subject, clarifying questions).
-
-Respond with ONLY "NEW" if the new message is asking about a completely different topic/subject area (e.g., switching from Computer Science to English, or from Math to Music).
-
-Examples:
-- Previous: "What CS classes are available?" | New: "Which one teaches algorithms?" → SAME
-- Previous: "Show me math classes" | New: "What about in summer?" → SAME
-- Previous: "Computer science classes in fall" | New: "When does it meet?" → SAME
-- Previous: "What programming classes can I take?" | New: "English 1B in spring" → NEW
-- Previous: "Show me biology courses" | New: "What about chemistry classes?" → NEW
-
-Your response (SAME or NEW):"""
-
-        response = openai_client.chat.completions.create(
-            model=Config.CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": "You are an expert at detecting conversation topic changes. Reply with only SAME or NEW."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0,
-            max_tokens=5
-        )
-
-        result = response.choices[0].message.content.strip().upper()
-        is_same_topic = result == "SAME"
-
-        logger.info(f"Topic detection: Previous=[{previous_context[:50]}...] | Current=[{current_message}] → {result} (same_topic={is_same_topic})")
-        return is_same_topic
-
-    except Exception as e:
-        logger.error(f"Failed to detect topic continuation: {e}")
-        # On error, default to treating as new topic to avoid contamination
-        return False
-
-
-# System prompts for the chatbot
+# System prompts for the chatbot.
+#
+# Every /chat request is served by a single model call — no separate LLM
+# classifiers for language, topic-continuation, or course-vs-identity. Those
+# decisions are folded in here as instructions the model applies against the
+# full message + conversation history it already has.
 def get_system_prompts():
     prompts = [
+        # --- Identity & scope ---
         "You are a helpful academic advisor named Sierra Class Helper, created by student Ben Rosario.",
         f"Today's date is {datetime.now().strftime('%B %d, %Y')}. Use this date when discussing course schedules and enrollment.",
         "Pay extreme attention to requested dates and times to ensure good responses for users.",
         "You are helping students from the California Community College 'Sierra College'. Their website is https://sierracollege.edu.",
         "Sierra College has TWO active campuses: Rocklin Campus (main campus) and Nevada County Campus (Grass Valley/Tahoe-Truckee area). NOTE: The Roseville Campus is CLOSED and no longer offers courses. When students ask about campus location, clearly state which campus each course is at.",
-        "You can advise students on any academic matter, grabbing information from the Sierra College website.",
-        "IMPORTANT: ALWAYS copy the language of the user. Example: If a user speaks to you in Ukrainian, respond in Ukrainian.",
+
+        # --- Language handling (replaces the removed detect_language LLM call) ---
+        "IMPORTANT: Reply in the same language the user's most recent message is in. If the current message is too short to identify a language (e.g. a one-word reply), use the language of prior turns in the conversation. Do not switch languages unless the user does.",
+
+        # --- Deciding whether to talk about courses at all
+        # (replaces the removed is_course_related_question LLM call) ---
+        "The user's message will be followed by a 'Retrieved courses:' block containing the top matches from a semantic search. These are candidates — they are NOT guaranteed to be relevant. Decide whether the user is actually asking about courses. If the user is asking a general question (who you are, what you do, how you work, greetings, small talk, thanks), answer that question directly and DO NOT mention, list, or reference the retrieved courses at all — treat that block as if it weren't there. Only list courses when the user is genuinely asking about them.",
+        "If the retrieved-courses block is empty, or if none of the retrieved courses actually match what the user asked for (e.g. they asked about Physics but the retrieval returned unrelated subjects), politely tell the user no matching courses were found and suggest they try different search terms or related subjects. Do NOT invent courses, and do NOT present unrelated courses as if they were matches.",
+
+        # --- Course-listing format (used when courses ARE being presented) ---
         "IMPORTANT: When listing courses, ALWAYS show the full course name (e.g., 'College Algebra (MATH0012)') at the start of each course listing.",
         "IMPORTANT: ALWAYS include the CRN (Course Reference Number) for EVERY course you list. The CRN is critical information that students need to register. Example format: 'CRN: 12345' or include it prominently in the course listing.",
         "IMPORTANT: ALWAYS include the instructor's name for EVERY course you list. If multiple instructors, list all of them. If no instructor is assigned, clearly state 'Instructor: TBA' or 'No instructor assigned'.",
@@ -270,7 +143,6 @@ def get_system_prompts():
         "Make sure to show class start and end dates, and comment on whether or not the class has begun instruction by checking today's date.",
         "Make sure to format enrollment numbers as fractions for a cleaner presentation (e.g., '24/35 enrolled').",
         "IMPORTANT: ALWAYS show waitlist information for EVERY course. Format it as 'Waitlist: X/Y' where X is current waitlist enrollment and Y is waitlist capacity. Always include this, even if the waitlist is 0/20 or 0/0.",
-        "If the user doesn't ask for/about classes, do not show them.",
         "Change dates from 'M' to 'Monday' and so on, also change times from '900' to '9:00am', for example.",
         "Make sure to give the building letter for classes, not just the building name. Make sure to append the building letter directly next to the room number, e.g. V303.",
     ]
@@ -339,206 +211,29 @@ async def search(request: CourseSearchRequest):
         logger.error(f"Search failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-def is_course_related_question(message: str) -> bool:
-    """
-    Determine if the user's question is asking about courses or is a general/identity question
-    Uses a quick LLM check to classify the question type
-    """
-    classification_prompt = """You are a question classifier. Determine if the user's question is asking about COURSES/CLASSES at a college, or if it's a general/identity question.
-
-Examples of COURSE-RELATED questions (return TRUE):
-- "What CS classes are available?"
-- "Show me math courses"
-- "Are there any biology classes on Monday?"
-- "When does calculus start?"
-- "What classes does Professor Smith teach?"
-
-Examples of NON-COURSE questions (return FALSE):
-- "What are you?"
-- "Who are you?"
-- "What is your purpose?"
-- "How do you work?"
-- "Tell me about yourself"
-- "Hello"
-- "What can you do?"
-
-Respond with ONLY "TRUE" or "FALSE"."""
-
-    try:
-        response = openai_client.chat.completions.create(
-            model=Config.CHAT_MODEL,
-            messages=[
-                {"role": "system", "content": classification_prompt},
-                {"role": "user", "content": f"Is this asking about courses/classes? '{message}'"}
-            ],
-            temperature=0,
-            max_tokens=10
-        )
-
-        answer = response.choices[0].message.content.strip().upper()
-        return answer == "TRUE"
-    except Exception as e:
-        logger.warning(f"Question classification failed, defaulting to course-related: {e}")
-        # Default to treating as course-related to maintain backward compatibility
-        return True
-
-def _handle_non_course_question(request: ChatRequest) -> ChatResponse:
-    """
-    Handle general/identity questions without course search.
-
-    Args:
-        request: The chat request containing user message and history
-
-    Returns:
-        ChatResponse with identity/general information and 0 courses searched
-    """
-    logger.info("Non-course question detected, responding without course search")
-
-    identity_prompt = """You are Sierra Class Helper, an AI academic advisor created by Sierra College student Ben Rosario.
-
-**Your Purpose:**
-I help students at Sierra College (a California Community College) find and explore courses across our two active campuses:
-- Rocklin Campus (main campus)
-- Nevada County Campus (Grass Valley/Tahoe-Truckee area)
-
-Note: The Roseville Campus is no longer open.
-
-**How I Work:**
-I use a RAG (Retrieval-Augmented Generation) system:
-- Course data is scraped from Sierra College's course catalog
-- Text descriptions are converted into vector embeddings using OpenAI's text-embedding-3-small model
-- Embeddings are stored in a FAISS vector database for fast semantic search
-- When you ask about courses, I search for semantically similar courses
-- I use GPT-4o-mini to generate natural language responses based on the retrieved courses
-
-**What I Can Do:**
-- Search for courses by subject (e.g., "Show me CS classes")
-- Find courses by schedule (e.g., "What math classes are on Monday?")
-- Check course availability and enrollment
-- Show course details (instructor, time, location, campus)
-- Answer questions about course schedules and requirements
-
-**Technical Stack:**
-- Backend: FastAPI (Python)
-- Vector Database: FAISS
-- Embeddings: OpenAI text-embedding-3-small
-- LLM: OpenAI GPT-4o-mini
-- Bot Interface: Discord.py
-
-**Data Freshness:**
-Course data is updated regularly from Sierra College's course catalog. Check the Sierra College website for the most current enrollment information.
-
-Ask me about any courses at Sierra College!"""
-
-    messages = [
-        {"role": "system", "content": identity_prompt},
-        # Anchor the model to the real date — without this, general questions like
-        # "what day is it?" get answered from the model's training cutoff.
-        {"role": "system", "content": f"Today's date is {datetime.now().strftime('%B %d, %Y')}."},
-    ]
-
-    # Add conversation history if provided
-    if request.conversation_history:
-        for msg in request.conversation_history[-10:]:  # Limit to last 10 messages
-            messages.append({"role": msg.role, "content": msg.content})
-
-    # Detect language and add current message with explicit language instruction
-    lang_code, lang_name = detect_language(request.message, request.conversation_history)
-    messages.append({
-        "role": "user",
-        "content": f"{request.message}\n\nIMPORTANT: Respond in {lang_name}."
-    })
-
-    completion = openai_client.chat.completions.create(
-        model=Config.CHAT_MODEL,
-        messages=messages
-    )
-
-    response_text = completion.choices[0].message.content
-
-    return ChatResponse(
-        response=response_text,
-        courses_searched=0
-    )
-
-
 def _build_search_query(request: ChatRequest) -> str:
     """
-    Build enhanced search query with conversation context if needed.
+    Build the retrieval query.
 
-    Intelligently detects if the current message is a follow-up to previous
-    conversation and adds context accordingly.
-
-    Args:
-        request: The chat request with message and conversation history
-
-    Returns:
-        str: Enhanced search query (with or without context)
+    If we have prior turns, prepend up to the last two user messages so
+    fragment follow-ups ("what about summer?", "which one is online?") have
+    enough tokens to retrieve against. New-topic queries are safe from
+    contamination: `_STOPWORDS` in the lexical channel drops filler words
+    like "classes"/"available", and the IDF weighting means the distinctive
+    tokens in the *new* message dominate. That's the reason we can afford to
+    skip the previous LLM-based topic-continuation check entirely.
     """
-    search_query = request.message
+    if not request.conversation_history:
+        return request.message
 
-    # Only use conversation context if the query seems like a follow-up (not a new topic)
-    if request.conversation_history and len(request.conversation_history) > 0:
-        # Use GPT to intelligently detect if this is a continuation of the previous topic
-        is_same_topic = detect_topic_continuation(
-            request.message,
-            request.conversation_history
-        )
+    prior_user_msgs = [
+        msg.content for msg in request.conversation_history[-4:]
+        if msg.role == "user"
+    ][-2:]
+    if not prior_user_msgs:
+        return request.message
 
-        # Only add context if this is truly a follow-up on the same topic
-        if is_same_topic:
-            # Get last few messages for context (helps with "what about summer?" queries)
-            recent_context = " ".join([
-                msg.content for msg in request.conversation_history[-3:]
-                if msg.role == "user"
-            ])
-            search_query = f"{recent_context} {request.message}"
-            logger.info(f"Same topic continuation detected, enhanced search query with context: {search_query}")
-        else:
-            logger.info(f"New topic detected, using query without previous context: {search_query}")
-
-    return search_query
-
-
-
-
-def _handle_no_results(request: ChatRequest) -> ChatResponse:
-    """
-    Generate a response when the search returns nothing for a course query.
-
-    Args:
-        request: The chat request with user message and history
-
-    Returns:
-        ChatResponse informing the user no matches were found
-    """
-    logger.warning("No courses found for query")
-
-    lang_code, lang_name = detect_language(request.message, request.conversation_history)
-
-    messages = [
-        {"role": "system", "content": prompt}
-        for prompt in get_system_prompts()
-    ]
-
-    if request.conversation_history:
-        for msg in request.conversation_history[-10:]:
-            messages.append({"role": msg.role, "content": msg.content})
-
-    messages.append({
-        "role": "user",
-        "content": f"User query (in {lang_name}): {request.message}\n\nNo courses were found matching this query.\n\nIMPORTANT: Respond in {lang_name}. Politely inform the user that no courses match their specific query, and suggest they try different search terms or ask about related subjects."
-    })
-
-    completion = openai_client.chat.completions.create(
-        model=Config.CHAT_MODEL,
-        messages=messages
-    )
-
-    return ChatResponse(
-        response=completion.choices[0].message.content,
-        courses_searched=0
-    )
+    return " ".join(prior_user_msgs + [request.message])
 
 
 def _primary_instructor_rating(course: dict) -> str | None:
@@ -578,52 +273,41 @@ def _augment_with_ratings(course_text: str, course: dict) -> str:
     return course_text + "Instructor ratings (RateMyProfessors):\n" + "\n".join(rating_lines) + "\n"
 
 
-def _generate_course_response(request: ChatRequest, results: list[dict]) -> ChatResponse:
+def _generate_response(request: ChatRequest, results: list[dict]) -> ChatResponse:
     """
-    Generate final LLM response with course data.
+    Single LLM call that answers every /chat request.
 
-    Args:
-        request: The chat request with user message and history
-        results: List of validated course results to include
-
-    Returns:
-        ChatResponse with generated answer and course count
+    The system prompts tell the model to (a) reply in the user's language,
+    (b) ignore the retrieved-courses block for identity/greeting/non-course
+    questions, and (c) tell the user politely when no courses match — so we
+    can always retrieve and always pass the results in without branching.
     """
-    # Build context from search results (with professor ratings appended where available)
-    context = "\n".join(_augment_with_ratings(course_to_text(r), r) for r in results)
+    if results:
+        context = "\n".join(_augment_with_ratings(course_to_text(r), r) for r in results)
+        retrieval_block = f"Retrieved courses ({len(results)}):\n{context}"
+    else:
+        retrieval_block = "Retrieved courses: (none returned)"
 
-    # Generate response using OpenAI
-    messages = [
-        {"role": "system", "content": prompt}
-        for prompt in get_system_prompts()
-    ]
+    messages = [{"role": "system", "content": p} for p in get_system_prompts()]
 
-    # Add conversation history if provided
     if request.conversation_history:
-        for msg in request.conversation_history[-10:]:  # Limit to last 10 messages
+        for msg in request.conversation_history[-10:]:
             messages.append({"role": msg.role, "content": msg.content})
 
-    # Detect the language of the user's query (using conversation history for context)
-    lang_code, lang_name = detect_language(request.message, request.conversation_history)
-
-    # Add current query with course context and explicit language instruction
     messages.append({
         "role": "user",
-        "content": f"User query (in {lang_name}): {request.message}\n\nHere are the top {len(results)} matching courses from the search:\n{context}\n\nIMPORTANT: Respond in {lang_name}. Present these {len(results)} courses to the user, or respond to their question if they're not asking about specific courses."
+        "content": f"{request.message}\n\n---\n{retrieval_block}",
     })
 
-    completion = openai_client.chat.completions.create(
+    completion = _get_openai_client().chat.completions.create(
         model=Config.CHAT_MODEL,
-        messages=messages
+        messages=messages,
     )
 
-    response_text = completion.choices[0].message.content
-
     logger.info(f"Generated response for: {request.message}")
-
     return ChatResponse(
-        response=response_text,
-        courses_searched=len(results)
+        response=completion.choices[0].message.content,
+        courses_searched=len(results),
     )
 
 
@@ -632,34 +316,24 @@ def _generate_course_response(request: ChatRequest, results: list[dict]) -> Chat
 @limiter.limit("200/day")
 async def chat(request: Request, body: ChatRequest):
     """
-    Chat endpoint that searches courses and generates AI response
+    Chat endpoint that searches courses and generates AI response.
 
-    Uses RAG to provide context-aware responses. Rate limited per Discord user
-    (via X-Discord-User header) or per IP if header is absent.
+    One retrieval pass + one LLM call per request. Language handling,
+    topic-continuation, and course-vs-identity decisions all happen inside
+    that single response call via the system prompts — no separate
+    classifier round-trips. Rate limited per Discord user (via
+    X-Discord-User header) or per IP if header is absent.
     """
     try:
         logger.info(f"Chat request: {body.message}")
         record_message(request.headers.get("X-Discord-User"), len(body.message))
 
-        # Check if this is a course-related question
-        is_course_question = is_course_related_question(body.message)
-
-        if not is_course_question:
-            return _handle_non_course_question(body)
-
-        # Course-related: build a context-aware query and trust hybrid search.
-        # (The old extract-intent -> keyword-filter -> LLM-validate gate was both a
-        # source of false "no results" and the bulk of the per-request LLM cost;
-        # hybrid retrieval in search_courses now does the relevance work.)
         search_query = _build_search_query(body)
         top_courses = search_courses(search_query, k=body.num_courses)
         results = all_sections_for(top_courses)  # every section of each top course
         logger.info(f"Search returned {len(results)} sections across {len(top_courses)} courses")
 
-        if not results:
-            return _handle_no_results(body)
-
-        return _generate_course_response(body, results)
+        return _generate_response(body, results)
 
     except HTTPException:
         raise

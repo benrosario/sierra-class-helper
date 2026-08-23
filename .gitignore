@@ -44,3 +44,12 @@ course_hashes.json
 course_hashes_no_enrollment.json
 analytics.sqlite
 course_data/
+<<<<<<< HEAD
+=======
+
+# Other
+docs/
+CLAUDE.md
+DEPLOYMENT.md
+.gitignore
+>>>>>>> 159e5b4 (updated .gitignore)

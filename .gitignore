@@ -44,3 +44,6 @@ course_hashes.json
 course_hashes_no_enrollment.json
 analytics.sqlite
 course_data/
+
+# Other
+docs/

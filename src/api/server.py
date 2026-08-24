@@ -7,8 +7,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
-import os
-import json
 from datetime import datetime
 from openai import OpenAI
 from slowapi import Limiter, _rate_limit_exceeded_handler

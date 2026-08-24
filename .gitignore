@@ -19,7 +19,10 @@ __pycache__/
 .LSOverride
 
 # IDE
-.vscode/
+.vscode/*
+# Keep the shared workspace settings (Pylance strictness, interpreter path).
+# Personal files like launch.json, tasks.json stay ignored.
+!.vscode/settings.json
 .idea/
 *.swp
 *.swo

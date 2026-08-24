@@ -13,8 +13,10 @@ import faiss
 import os
 import logging
 import math
-import numpy as np
 import re
+from typing import Any
+
+import numpy as np
 from openai import OpenAI
 
 from src.config import Config
@@ -40,12 +42,17 @@ metadata_file = str(ID_TO_COURSE_JSON)
 # State populated by initialize(); left unset so `import` is cheap. reload_index()
 # may reassign these later. VALID_SUBJECTS starts empty so pure functions like
 # resolve_course_code (which falls back to SUBJECT_MAPPING) still work uninitialized.
-client: OpenAI | None = None
-courses: dict | None = None
-index = None
-id_to_course_list: list | None = None
+#
+# These are annotated Any because Pylance can't narrow module globals across a
+# `_require_initialized()` guard call — using Optional here would produce a
+# false-positive warning on every read site. The runtime contract ("must call
+# initialize() before search_courses()") is enforced by _require_initialized().
+client: Any = None
+courses: Any = None
+index: Any = None
+id_to_course_list: Any = None
 VALID_SUBJECTS: set = set()
-LEXICAL_INDEX: dict | None = None
+LEXICAL_INDEX: Any = None
 
 
 def initialize() -> None:

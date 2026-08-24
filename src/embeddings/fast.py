@@ -7,7 +7,6 @@ import faiss
 import os
 import logging
 import hashlib
-from pathlib import Path
 from datetime import datetime
 from src.utils.course_loader import load_all_semesters
 from src.utils.paths import COURSE_HASHES_NO_ENROLLMENT_JSON
@@ -20,7 +19,6 @@ from src.embeddings.incremental import (
     dimension,
     index_file,
     metadata_file,
-    hash_file
 )
 import numpy as np
 
@@ -124,8 +122,8 @@ def fast_incremental_update():
 
             elapsed = (datetime.now() - start_time).total_seconds()
             logger.info(f"FAST UPDATE complete in {elapsed:.1f} seconds!")
-            logger.info(f"Total OpenAI API calls: 0")
-            logger.info(f"Estimated cost: $0.0000")
+            logger.info("Total OpenAI API calls: 0")
+            logger.info("Estimated cost: $0.0000")
             return
 
         # Slow path: Need to rebuild index

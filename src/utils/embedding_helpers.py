@@ -179,12 +179,6 @@ def course_to_text(course: dict, informalName_func, meetingDays_func, get_campus
 
     meeting_days = meetingDays_func(course["meetings"])
 
-    faculty_list = [
-        f"{item['name']} ({item.get('email', 'no email provided')})"
-        for item in course["faculty"]
-    ]
-    faculty_str = ", ".join(faculty_list) if faculty_list else "No instructor assigned"
-
     # Get start and end dates from the first meeting
     start_date = "TBA"
     end_date = "TBA"

@@ -8,7 +8,6 @@ import os
 import logging
 import numpy as np
 import hashlib
-from pathlib import Path
 from openai import OpenAI
 from datetime import datetime
 

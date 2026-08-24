@@ -1,0 +1,7 @@
+{
+  "//": "Pylance/Pyright configuration. 'basic' catches real bugs (unknown attributes, wrong arg counts, unresolved imports) without flagging every Optional access or Any propagation. 'strict' is for greenfield type-first codebases and produces excessive noise here — a lot of course data is dict[str, Any] loaded from JSON, and there are module-level globals reassigned by initialize() that Pylance can't narrow across a guard call. Bump to 'strict' if/when the codebase adopts TypedDicts for course data and switches to a SearchIndex state class.",
+  "python.analysis.typeCheckingMode": "basic",
+
+  "//2": "Prefer the project venv's interpreter so imports resolve without needing to select it every session.",
+  "python.defaultInterpreterPath": ".venv/bin/python"
+}

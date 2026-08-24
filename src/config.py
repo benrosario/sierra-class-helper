@@ -37,7 +37,7 @@ class Config:
     # --- OpenAI models ---
     EMBEDDING_MODEL = "text-embedding-3-small"
     EMBEDDING_DIMENSION = 1536
-    CHAT_MODEL = "gpt-4o-mini"
+    CHAT_MODEL = "gpt-5.6-luna"
 
     # --- Persistent data ---
     # Root directory for writable state. '.' (repo root) locally; on Railway

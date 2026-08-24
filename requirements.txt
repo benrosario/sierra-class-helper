@@ -4,7 +4,7 @@ faiss-cpu>=1.7.4
 numpy>=1.24.0
 
 # Web scraping
-playwright>=1.40.0
+playwright==1.62.0
 
 # API Server
 fastapi>=0.104.0

@@ -292,9 +292,17 @@ def _generate_response(request: ChatRequest, results: list[dict]) -> ChatRespons
         for msg in request.conversation_history[-10:]:
             messages.append({"role": msg.role, "content": msg.content})
 
+    # Put the retrieval block FIRST and the user's actual message last, so the
+    # model reads the query in the user's language most recently. Retrieved
+    # course descriptions can be in other languages (e.g. SPAN, FREN course
+    # entries) and would otherwise bias the reply language via recency.
     messages.append({
         "role": "user",
-        "content": f"{request.message}\n\n---\n{retrieval_block}",
+        "content": (
+            f"{retrieval_block}\n\n---\n"
+            f"User message: {request.message}\n\n"
+            "Reply in the same language this message is written in."
+        ),
     })
 
     completion = _get_openai_client().chat.completions.create(

@@ -7,7 +7,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+
+from src.utils.paths import ID_TO_COURSE_JSON
 from openai import OpenAI
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -106,6 +108,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     courses_searched: int
+    data_updated_at: str | None = None  # ISO-8601 UTC timestamp of the index file's last write
 
 # System prompts for the chatbot.
 #
@@ -203,7 +206,8 @@ async def search(request: CourseSearchRequest):
         return {
             "query": request.query,
             "num_results": len(sections),
-            "courses": sections
+            "courses": sections,
+            "data_updated_at": _data_last_updated(),
         }
     except Exception as e:
         logger.error(f"Search failed: {e}")
@@ -314,7 +318,22 @@ def _generate_response(request: ChatRequest, results: list[dict]) -> ChatRespons
     return ChatResponse(
         response=completion.choices[0].message.content,
         courses_searched=len(results),
+        data_updated_at=_data_last_updated(),
     )
+
+
+def _data_last_updated() -> str | None:
+    """
+    Return the ISO-8601 UTC timestamp of the last course-index write, or None
+    if the file isn't there yet. The scheduler writes id_to_course.json
+    immediately after every successful refresh, so its mtime is a reliable
+    "when was the currently-served data last built" signal.
+    """
+    try:
+        mtime = ID_TO_COURSE_JSON.stat().st_mtime
+    except OSError:
+        return None
+    return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 
 
 @app.post("/chat", response_model=ChatResponse)

@@ -8,11 +8,15 @@ from discord.ext import commands
 import time
 import logging
 import aiohttp
+from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from src.config import Config
 from src.utils.course_formatting import informalName, summarize_meetings
 from src.utils.campus import get_campus
+
+_PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -52,15 +56,49 @@ HISTORY_TTL = 30 * 60  # seconds
 MAX_HISTORY_PER_USER = 10
 
 
-def format_outgoing(text: str) -> list[str]:
+def _format_updated_line(iso_ts: str | None) -> str | None:
     """
-    Attach the disclaimer and split into Discord-sized (<=2000 char) chunks.
+    Turn the API's ISO-8601 UTC timestamp into a "Classes last updated: HH:MM PDT
+    (X minutes ago)" line, in Pacific time. Returns None if the timestamp is
+    missing or malformed so the caller can skip the line entirely.
+    """
+    if not iso_ts:
+        return None
+    try:
+        updated = datetime.fromisoformat(iso_ts)
+    except (TypeError, ValueError):
+        return None
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    local = updated.astimezone(_PACIFIC_TZ)
+    now = datetime.now(_PACIFIC_TZ)
+    delta_min = max(int((now - local).total_seconds() // 60), 0)
+    if delta_min < 1:
+        ago = "just now"
+    elif delta_min == 1:
+        ago = "1 minute ago"
+    elif delta_min < 60:
+        ago = f"{delta_min} minutes ago"
+    elif delta_min < 60 * 24:
+        hours = delta_min // 60
+        ago = f"{hours} hour{'s' if hours != 1 else ''} ago"
+    else:
+        days = delta_min // (60 * 24)
+        ago = f"{days} day{'s' if days != 1 else ''} ago"
+    return f"_Classes last updated: {local.strftime('%H:%M %Z')} ({ago})_"
 
-    The disclaimer rides on the final chunk when it fits, otherwise it's sent as
-    its own trailing message — so every reply ends with it no matter how long the
-    body is.
+
+def format_outgoing(text: str, data_updated_at: str | None = None) -> list[str]:
     """
-    footer = f"\n\n{DISCLAIMER}"
+    Attach the footer (last-updated line + disclaimer) and split into
+    Discord-sized (<=2000 char) chunks. The footer rides on the final chunk
+    when it fits, otherwise it's sent as its own trailing message — so every
+    reply ends with it no matter how long the body is.
+    """
+    updated_line = _format_updated_line(data_updated_at)
+    footer_body = f"{updated_line}\n{DISCLAIMER}" if updated_line else DISCLAIMER
+    footer = f"\n\n{footer_body}"
+
     if len(text) + len(footer) <= DISCORD_LIMIT:
         return [text + footer]
 
@@ -68,7 +106,7 @@ def format_outgoing(text: str) -> list[str]:
     if len(chunks[-1]) + len(footer) <= DISCORD_LIMIT:
         chunks[-1] += footer
     else:
-        chunks.append(DISCLAIMER)
+        chunks.append(footer_body)
     return chunks
 
 
@@ -246,9 +284,14 @@ class SierraClassHelper(commands.Cog):
             logger.error(f"Failed to call chat API: {e}")
             raise
 
-    async def _send_followup(self, interaction: discord.Interaction, text: str):
-        """Send a (deferred) slash-command reply, with the disclaimer + chunking."""
-        for chunk in format_outgoing(text):
+    async def _send_followup(
+        self,
+        interaction: discord.Interaction,
+        text: str,
+        data_updated_at: str | None = None,
+    ):
+        """Send a (deferred) slash-command reply, with the footer + chunking."""
+        for chunk in format_outgoing(text, data_updated_at):
             await interaction.followup.send(chunk, ephemeral=False)
 
     @app_commands.command(name="ask", description="Ask Sierra Class Helper a question about courses")
@@ -262,7 +305,7 @@ class SierraClassHelper(commands.Cog):
 
             # Call the API with user ID for conversation tracking
             result = await self.call_chat_api(question, interaction.user.id)
-            await self._send_followup(interaction, result["response"])
+            await self._send_followup(interaction, result["response"], result.get("data_updated_at"))
 
             logger.info(f"Response sent to {interaction.user}")
 
@@ -317,7 +360,7 @@ class SierraClassHelper(commands.Cog):
                     self.add_to_history(interaction.user.id, "user", f"Searched courses: {query}")
                     self.add_to_history(interaction.user.id, "assistant", output)
 
-                    await self._send_followup(interaction, output)
+                    await self._send_followup(interaction, output, result.get("data_updated_at"))
                 else:
                     await self._send_followup(interaction, "Failed to search courses. Please try again.")
 
@@ -377,8 +420,8 @@ async def on_message(message):
         content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
     content = content.strip()
 
-    async def respond(text: str) -> None:
-        chunks = format_outgoing(text)
+    async def respond(text: str, data_updated_at: str | None = None) -> None:
+        chunks = format_outgoing(text, data_updated_at)
         await message.reply(chunks[0])
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
@@ -409,7 +452,7 @@ async def on_message(message):
                 return
 
             result = await cog.call_chat_api(query, message.author.id)
-            await respond(result["response"])
+            await respond(result["response"], result.get("data_updated_at"))
 
             logger.info(f"Response sent to {message.author}")
 

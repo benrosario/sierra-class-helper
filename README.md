@@ -1,3 +1,6 @@
+<img width="894" height="532" alt="GIF of the bot being used in Discord." src="https://github.com/user-attachments/assets/52df3be4-f40f-42a9-b099-2b624ebda6d1" />
+
+
 # Sierra Class Helper
 
 An AI academic advisor for Sierra College. Students @-mention a Discord bot with questions like *"what CS classes are open in fall?"* or *"when does MATH 31 meet?"* and get accurate, up-to-date answers pulled from the college's live course catalog.

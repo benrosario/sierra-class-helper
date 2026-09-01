@@ -55,8 +55,8 @@ class TestNormalizeCourseQuery:
 class TestExtractCourseCode:
     """Test the extract_course_code function.
 
-    Passes an explicit valid_subjects set so these tests don't depend on the
-    module-level VALID_SUBJECTS (which is empty until initialize() runs).
+    Passes an explicit valid_subjects set so these tests don't need a
+    SearchIndex to be constructed.
     """
 
     VALID = {"MATH", "CHEM", "CSCI", "ENGL", "PHYS"}
@@ -135,12 +135,11 @@ class TestDetectSubjectPreference:
 @requires_openai
 @requires_faiss_index
 class TestSearchCoursesIntegration:
-    """Integration tests for search_courses function"""
+    """Integration tests for SearchIndex.search() — need a real key + built index."""
 
     def test_search_returns_results(self):
-        """search_courses should return course dictionaries"""
-        from src.embeddings.core import search_courses
-        results = search_courses("computer science classes", k=3)
+        from src.embeddings.core import get_index
+        results = get_index().search("computer science classes", k=3)
         assert isinstance(results, list)
         assert len(results) <= 3
         if results:
@@ -148,23 +147,11 @@ class TestSearchCoursesIntegration:
             assert "courseTitle" in results[0]
 
     def test_search_respects_k_limit(self):
-        """search_courses should not return more than k results"""
-        from src.embeddings.core import search_courses
-        results = search_courses("programming", k=2)
+        from src.embeddings.core import get_index
+        results = get_index().search("programming", k=2)
         assert len(results) <= 2
 
-    def test_search_with_subject_hint(self):
-        """search_courses with subject_hint should prefer that subject"""
-        from src.embeddings.core import search_courses
-        results = search_courses("programming classes", k=5, subject_hint="Computer Science")
-        # Should have some CSCI results
-        if results:
-            csci_count = sum(1 for r in results if r.get("subject") == "CSCI")
-            # At least some should be CSCI
-            assert csci_count >= 0  # May not find any depending on data
-
     def test_search_generic_query(self):
-        """search_courses should handle generic queries"""
-        from src.embeddings.core import search_courses
-        results = search_courses("easy classes", k=3)
+        from src.embeddings.core import get_index
+        results = get_index().search("easy classes", k=3)
         assert isinstance(results, list)

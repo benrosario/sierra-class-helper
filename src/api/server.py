@@ -17,8 +17,7 @@ from slowapi.util import get_remote_address
 from src.config import Config
 from src.api.analytics import get_stats, init_schema, record_message
 from src.api.scheduler import start_scheduler, stop_scheduler
-from src.embeddings import core as embeddings_core
-from src.embeddings.core import search_courses, course_to_text, all_sections_for
+from src.embeddings.core import get_index, course_to_text
 from src.utils.professor_ratings import get_rating, format_rating
 
 # Setup logging
@@ -42,11 +41,11 @@ limiter = Limiter(key_func=_rate_limit_key)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Boot-time setup: initialize the embeddings module (loads the FAISS + lexical
-    index, builds the OpenAI client) and analytics schema, then start the
-    background refresh scheduler when Config.ENABLE_SCHEDULER is set.
+    Boot-time setup: build the SearchIndex (loads FAISS + lexical index, builds
+    OpenAI client) and analytics schema, then start the background refresh
+    scheduler when Config.ENABLE_SCHEDULER is set.
     """
-    embeddings_core.initialize()
+    get_index()  # force lazy build now so the first /chat request isn't slow
     init_schema()
     if Config.ENABLE_SCHEDULER:
         start_scheduler()
@@ -196,8 +195,10 @@ async def search(request: CourseSearchRequest):
         logger.info(f"Searching for: {request.query}")
         # num_results is the number of distinct courses; expand each to all of its
         # sections so students see every meeting time / instructor / CRN.
-        courses = search_courses(request.query, k=request.num_results)
-        sections = all_sections_for(courses)
+        # Snapshot the index once so a concurrent reload can't swap it mid-request.
+        index = get_index()
+        courses = index.search(request.query, k=request.num_results)
+        sections = index.all_sections_for(courses)
         # Attach each section's RateMyProfessors rating here. The bot formats the
         # /search results itself, but it runs as a separate service without the
         # ratings file, so the lookup has to happen on the API side.
@@ -354,8 +355,10 @@ async def chat(request: Request, body: ChatRequest):
         record_message(request.headers.get("X-Discord-User"), len(body.message))
 
         search_query = _build_search_query(body)
-        top_courses = search_courses(search_query, k=body.num_courses)
-        results = all_sections_for(top_courses)  # every section of each top course
+        # Snapshot the index once so a concurrent reload can't swap it mid-request.
+        index = get_index()
+        top_courses = index.search(search_query, k=body.num_courses)
+        results = index.all_sections_for(top_courses)
         logger.info(f"Search returned {len(results)} sections across {len(top_courses)} courses")
 
         return _generate_response(body, results)

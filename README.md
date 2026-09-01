@@ -1,289 +1,131 @@
 # Sierra Class Helper
 
-An AI-powered academic advisor for Sierra College students. Students can search for courses and get personalized academic advice through a Discord bot interface.
+An AI academic advisor for Sierra College. Students @-mention a Discord bot with questions like *"what CS classes are open in fall?"* or *"when does MATH 31 meet?"* and get accurate, up-to-date answers pulled from the college's live course catalog.
+
+---
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    users(["Discord users"]) --> bot["**bot**<br/>discord.py"]
+    bot -->|HTTP| api["**api**<br/>FastAPI"]
+    api --> retrieval["Hybrid retrieval<br/>FAISS + IDF-weighted lexical"]
+    api --> openai(["OpenAI<br/>embeddings + chat"])
+    scheduler["In-process scheduler<br/>hourly refresh"] --> scraper["Playwright scraper<br/>Sierra course catalog"]
+    scraper --> volume[("Railway volume<br/>/data")]
+    volume --> retrieval
+    scheduler -.runs inside.- api
 ```
-Discord Bot (discord_bot.py)
-    ↓ HTTP
-FastAPI Server (api_server.py)
-    ↓
-RAG System (embeddings.py)
-    ↓
-OpenAI API
+
+Two services on Railway from one repo: `api` (FastAPI + embedded scheduler) and `bot` (Discord frontend).
+
+---
+
+## What makes it work
+
+- **Hybrid retrieval** — FAISS vector search fused with an IDF-weighted lexical channel. The lexical side keeps its magnitude (not just rank), so distinctive-but-rare title words like *"linear"* can beat what pure embeddings prefer. See [src/embeddings/core.py](src/embeddings/core.py).
+- **In-process scheduler** — course data refreshes hourly and professor ratings daily, writing to the same volume the API serves from. Railway volumes can't be shared between services, so a separate cron container's writes would never reach the API. See [src/api/scheduler.py](src/api/scheduler.py).
+- **Atomic reload** — the scheduler builds a fresh `SearchIndex` and swaps one module-level reference. In-flight requests keep working against their snapshot; the next request sees the new data. No half-swapped state.
+- **Retrieval-first response** — every `/chat` call does one FAISS+lexical retrieval and one LLM call. Language, topic-continuation, and course-vs-identity decisions live in the system prompts rather than as separate classifier round-trips.
+
+---
+
+## Layout
+
+```
+src/
+├── api/            FastAPI server + in-process refresh scheduler + analytics
+├── bot/            Discord bot (thin frontend; every message calls the API)
+├── embeddings/     SearchIndex class + hybrid retrieval + incremental/fast rebuild CLIs
+├── scraper/        Playwright scraper + RateMyProfessors fetcher
+├── jobs/           Refresh jobs run by the scheduler
+├── utils/          Formatting, paths, subject mapping, sanitize, RMP lookup
+└── config.py       Single source of truth for models, filenames, and env vars
 ```
 
-## Features
+> [!NOTE]
+> Only `api_server.py` and `discord_bot.py` live at the repo root as thin entry points for Railway's start commands. Everything else is under `src/`.
 
-- **Semantic Course Search**: Find courses using natural language queries
-- **AI Academic Advisor**: Get personalized course recommendations
-- **Discord Integration**: Easy access through Discord commands
-- **REST API**: Flexible API for future integrations
+---
 
-## Setup
+## Quickstart
 
-### Prerequisites
-
-- Python 3.9+
-- OpenAI API key
-- Discord bot token (for Discord integration)
-
-### Installation
-
-1. **Clone the repository** (or navigate to project directory)
-
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. **Install Playwright browsers** (for web scraping)
-   ```bash
-   playwright install chromium
-   ```
-
-4. **Set up environment variables**
-   ```bash
-   cp .env.example .env
-   ```
-
-   Edit `.env` and add your API keys:
-   ```
-   OPENAI_API_KEY=your_openai_api_key_here
-   DISCORD_BOT_TOKEN=your_discord_bot_token_here
-   ```
-
-5. **Cold start: build the data files**
-
-   None of the generated data (`courses.index`, `id_to_course.json`,
-   `professor_ratings.json`, `course_data/`) is committed to git — it's
-   regenerated locally and lives on the Railway volume in production. On a fresh
-   checkout, build it once:
-
-   ```bash
-   python -m src.scraper.cli            # scrape active terms -> course_data/*.json
-   python -m src.scraper.ratemyprofessors  # fetch ratings -> professor_ratings.json
-   python -m src.embeddings.incremental     # full index build -> courses.index + id_to_course.json
-   ```
-
-   On Railway you don't run any of this by hand: with `SIERRA_ENABLE_SCHEDULER=1`
-   the API's in-process scheduler scrapes + rebuilds hourly and refreshes ratings
-   daily, building the index from scratch automatically on a fresh volume.
-
-## Running Locally
-
-### Option 1: API Server Only
-
-Start the FastAPI server:
 ```bash
-python api_server.py
+# Install
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+
+# Configure
+cp .env.example .env
+# Edit .env: set OPENAI_API_KEY and DISCORD_BOT_TOKEN
+
+# Cold-start data build (only needed once)
+python -m src.scraper.cli               # scrape currently-active terms
+python -m src.scraper.ratemyprofessors  # fetch professor ratings
+python -m src.embeddings.incremental    # build the FAISS index
+
+# Run both services
+./start_local.sh                        # api on :8000, bot connects to it
 ```
 
-The API will be available at `http://localhost:8000`
+Refresh data during development (skips re-embedding unchanged courses):
 
-Test it:
 ```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "What math classes are available?"}'
+python -m src.scraper.cli
+python -m src.embeddings.fast
 ```
 
-### Option 2: Discord Bot + API Server
+---
 
-1. **Terminal 1 - Start the API server:**
-   ```bash
-   python api_server.py
-   ```
+## Environment variables
 
-2. **Terminal 2 - Start the Discord bot:**
-   ```bash
-   python discord_bot.py
-   ```
+Read via `Config`, not `os.environ`. Set in `.env` locally, in the Railway dashboard in production.
 
-3. **Use in Discord:**
-   ```
-   !ask What CS classes are available on Monday?
-   !search calculus
-   ```
+| Variable | Service | Required | Purpose |
+|---|:---:|:---:|---|
+| `OPENAI_API_KEY` | api | ✓ | Embeddings + chat completions |
+| `DISCORD_BOT_TOKEN` | bot | ✓ | Bot login |
+| `API_URL` | bot | ✓ in prod | Where the bot POSTs `/chat`. On Railway, wired to the api's private domain. |
+| `SIERRA_DATA_DIR` | api | ✓ in prod | `/data` on Railway (mounted volume); defaults to `.` locally |
+| `SIERRA_ENABLE_SCHEDULER` | api | ✓ in prod | Set to `1` to run the hourly refresh loop |
+| `SIERRA_ADMIN_TOKEN` | api | optional | Gates `GET /admin/stats` |
+| `SIERRA_BOT_CHANNEL_IDS` | bot | optional | Comma-separated Discord channel IDs the bot responds in |
+
+---
+
+## Testing
+
+```bash
+pytest                             # all unit tests, sub-second
+pytest -m integration              # needs OPENAI_API_KEY + built FAISS index
+pytest tests/test_search_hybrid.py # single file
+```
+
+> [!TIP]
+> Tests focus on regression cases. Every failing search behavior that's been caught has a test named after it — e.g. `test_year_does_not_prefix_match_course_number`, `test_linear_algebra_beats_college_algebra`. If you fix a search bug, add the test that would have caught it.
+
+---
 
 ## Deployment
 
-### Deploying to Railway/Render/Fly.io
+Two Railway services from the same repo:
 
-1. **Create two services:**
-   - Service 1: API Server (`api_server.py`)
-   - Service 2: Discord Bot (`discord_bot.py`)
+| Service | Build | Notes |
+|---|---|---|
+| **api** | Dockerfile ([`Dockerfile.api`](Dockerfile.api)) using `mcr.microsoft.com/playwright/python` as the base image | Chromium + system libs pre-installed. Volume mounted at `/data`. |
+| **bot** | Railpack (auto-detected from `requirements.txt`) | No Dockerfile needed. Runs `python discord_bot.py`. |
 
-2. **Set environment variables** on your hosting platform:
-   ```
-   OPENAI_API_KEY=your_key
-   DISCORD_BOT_TOKEN=your_token
-   API_URL=https://your-api-server.railway.app
-   ```
+See [DEPLOYMENT.md](DEPLOYMENT.md) for the step-by-step setup, environment variables, and cold-start behavior.
 
-3. **Upload your data files:**
-   - `courses.index`
-   - `id_to_course.json`
-   - `course_data/` directory
+---
 
-4. **Deploy:**
-   - API Server: `python api_server.py`
-   - Discord Bot: `python discord_bot.py`
+## Discord commands
 
-### Example Railway Configuration
-
-**api-server/railway.toml:**
-```toml
-[build]
-builder = "NIXPACKS"
-
-[deploy]
-startCommand = "python api_server.py"
-```
-
-**discord-bot/railway.toml:**
-```toml
-[build]
-builder = "NIXPACKS"
-
-[deploy]
-startCommand = "python discord_bot.py"
-```
-
-## API Endpoints
-
-### `GET /`
-Health check
-
-### `GET /health`
-Detailed health status
-
-### `POST /search`
-Search for courses (returns raw data)
-
-**Request:**
-```json
-{
-  "query": "calculus",
-  "num_results": 3
-}
-```
-
-**Response:**
-```json
-{
-  "query": "calculus",
-  "num_results": 3,
-  "courses": [...]
-}
-```
-
-### `POST /chat`
-Chat with AI advisor (returns formatted response)
-
-**Request:**
-```json
-{
-  "message": "What math classes are on Monday?",
-  "num_courses": 3
-}
-```
-
-**Response:**
-```json
-{
-  "response": "Here are the math classes available on Monday...",
-  "courses_searched": 3
-}
-```
-
-## Discord Commands
-
-- `!ask <question>` - Ask the AI advisor a question
-- `!search <query>` - Search for courses (raw results)
-- `!help` - Show help information
-
-## Project Structure
-
-```
-class-gpt/
-├── api_server.py          # Entry point → src/api/server.py
-├── discord_bot.py         # Entry point → src/bot/bot.py
-├── src/
-│   ├── api/               # FastAPI server, scheduler, analytics
-│   ├── bot/               # Discord bot
-│   ├── embeddings/        # FAISS index build/load + hybrid search
-│   ├── scraper/           # Playwright scraper + RMP fetcher
-│   ├── utils/             # Formatting, paths, subject map, sanitize
-│   ├── jobs/              # Background refresh jobs
-│   └── config.py          # Single source of truth for tunables
-├── requirements.txt
-├── .env.example
-├── course_data/           # Scraped course data (JSON) — not committed
-├── courses.index          # FAISS vector index — not committed
-└── id_to_course.json      # Course metadata — not committed
-```
-
-## Development
-
-### Updating Course Data
-
-> **Important:** scraping alone does **not** change what the bot shows. The API
-> serves from the prebuilt FAISS index (`courses.index` / `id_to_course.json`), so
-> a refresh is always **scrape → rebuild the index → (re)load**.
-
-In production the scheduler does the whole refresh automatically (see the
-cold-start note in Setup). To refresh manually during local development:
-
-```bash
-python -m src.scraper.cli            # 1. scrape all active terms (or --term <slug>)
-python -m src.embeddings.fast        # 2. rebuild the index (re-embeds only changes)
-# 3. restart the API server (or let the in-process scheduler hot-swap on next tick)
-```
-
-The scraper also prunes `course_data/` to the latest snapshot of currently-active
-terms — ended terms and older duplicate scrapes are deleted — so the index never
-resurfaces classes that are over.
-
-### Testing
-
-Test the API:
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Search
-curl -X POST http://localhost:8000/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "computer science", "num_results": 5}'
-
-# Chat
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "I want to learn programming"}'
-```
-
-## Troubleshooting
-
-### "OPENAI_API_KEY is required" error
-Make sure you've set the `OPENAI_API_KEY` environment variable in your `.env` file.
-
-### "DISCORD_BOT_TOKEN is required" error
-Set the `DISCORD_BOT_TOKEN` in your `.env` file. Get it from [Discord Developer Portal](https://discord.com/developers/applications).
-
-### Discord bot not responding
-1. Check that the API server is running
-2. Verify `API_URL` points to the correct server
-3. Check bot permissions in Discord (needs to read messages)
-
-### Embeddings taking too long
-The first run creates embeddings for all courses, which can take a few minutes. Subsequent runs load from the saved index file.
-
-## License
-
-Created by Ben Rosario for Sierra College students.
-
-## Support
-
-For issues or questions, contact Ben Rosario.
+| Trigger | What it does |
+|---|---|
+| Mention the bot in an allowed channel | Ask a natural-language question about courses |
+| `/ask <question>` | Same, as a slash command |
+| `/search <query>` | Raw search results without LLM formatting |
+| `/clear` | Reset your 30-minute conversation context |

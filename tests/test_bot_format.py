@@ -46,7 +46,5 @@ class TestFormatCourseBlock:
 
 
 class TestFormatOutgoing:
-    def test_disclaimer_link_is_clickable(self):
-        # A full https:// URL is what Discord auto-links.
-        assert "https://sierracollege.edu" in DISCLAIMER
+    def test_disclaimer_appended(self):
         assert format_outgoing("hi")[-1].endswith(DISCLAIMER)

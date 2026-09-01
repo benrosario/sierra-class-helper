@@ -33,6 +33,10 @@ class Config:
     ENVIRONMENT = os.environ.get("ENVIRONMENT", "development")
     ADMIN_TOKEN = os.environ.get("SIERRA_ADMIN_TOKEN")
     ENABLE_SCHEDULER = os.environ.get("SIERRA_ENABLE_SCHEDULER") == "1"
+    BOT_CHANNEL_IDS: set[int] = {
+        int(cid) for cid in os.environ.get("SIERRA_BOT_CHANNEL_IDS", "").split(",")
+        if cid.strip()
+    }
 
     # --- OpenAI models ---
     EMBEDDING_MODEL = "text-embedding-3-small"

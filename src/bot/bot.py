@@ -28,12 +28,11 @@ API_URL = Config.require_api_url()
 intents = discord.Intents.default()
 intents.message_content = True
 intents.messages = True
-intents.dm_messages = True  # required so on_message fires for direct messages
 
 bot = commands.Bot(
     command_prefix=commands.when_mentioned,  # Only respond to mentions, no prefix
     intents=intents,
-    description="Sierra Class Helper - Your AI Academic Advisor"
+    description="Sierra Class Helper - Easily search for classes using natural language!"
 )
 
 RATE_LIMIT_MESSAGE = (
@@ -42,7 +41,7 @@ RATE_LIMIT_MESSAGE = (
 )
 
 # Disclaimer to append to each message
-DISCLAIMER = "I'm an AI assistant and this info can be inaccurate! — Always verify information at [sierracollege.edu](<https://sierracollege.edu>)!"
+DISCLAIMER = "AI can make mistakes. Verify important information on the [official Sierra College website](<https://sierracollege.edu>)."
 
 # Discord rejects messages longer than 2000 characters.
 DISCORD_LIMIT = 2000
@@ -354,39 +353,33 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    """Handle incoming messages.
+    """Handle @mentions in the allowed channel.
 
-    Triggered when the bot is mentioned in a server channel OR when anyone
-    sends the bot a direct message. DMs don't require an @mention — the bot
-    is the only recipient, so every DM is treated as a query.
+    Ignores DMs entirely and, when SIERRA_BOT_CHANNEL_ID is set, ignores any
+    channel other than that one. Slash commands are handled separately and
+    aren't affected by this gate.
     """
     if message.author == bot.user:
         return
 
-    is_dm = isinstance(message.channel, discord.DMChannel)
-    is_mention = bot.user in message.mentions
-
-    if not is_dm and not is_mention:
+    if isinstance(message.channel, discord.DMChannel):
         return
 
-    if is_dm:
-        content = message.content.strip()
-    else:
-        # Strip the @mention prefix so the model doesn't see "<@1234567> what classes..."
-        content = message.content
-        for mention in message.mentions:
-            content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
-        content = content.strip()
+    if bot.user not in message.mentions:
+        return
 
-    # Reply in channels (so the thread stays readable), plain send in DMs. Every
-    # reply gets the disclaimer + chunking via format_outgoing; the first chunk
-    # carries the "reply" affordance in channels, the rest stream after it.
+    if Config.BOT_CHANNEL_IDS and message.channel.id not in Config.BOT_CHANNEL_IDS:
+        return
+
+    # Strip the @mention prefix so the model doesn't see "<@1234567> what classes..."
+    content = message.content
+    for mention in message.mentions:
+        content = content.replace(f"<@{mention.id}>", "").replace(f"<@!{mention.id}>", "")
+    content = content.strip()
+
     async def respond(text: str) -> None:
         chunks = format_outgoing(text)
-        if is_dm:
-            await message.channel.send(chunks[0])
-        else:
-            await message.reply(chunks[0])
+        await message.reply(chunks[0])
         for chunk in chunks[1:]:
             await message.channel.send(chunk)
 
@@ -394,8 +387,7 @@ async def on_message(message):
         await respond(
             "Hi! I'm Sierra Class Helper. Ask me about courses!\n\n"
             "You can:\n"
-            "- DM me directly\n"
-            "- Mention me in a channel: '@SierraClassHelper What CS classes are available?'\n"
+            "- Mention me in this channel: '@SierraClassHelper What CS classes are available?'\n"
             "- Use slash commands: '/ask <question>', '/search <query>', or '/clear'"
         )
         return
@@ -409,8 +401,7 @@ async def on_message(message):
 
     async with message.channel.typing():
         try:
-            source = "DM" if is_dm else "mention"
-            logger.info(f"{source} from {message.author}: {content}")
+            logger.info(f"mention from {message.author}: {content}")
 
             cog = bot.get_cog("SierraClassHelper")
             if not cog:
@@ -425,7 +416,7 @@ async def on_message(message):
         except RateLimited:
             await respond(RATE_LIMIT_MESSAGE)
         except Exception as e:
-            logger.error(f"Error processing {('DM' if is_dm else 'mention')}: {e}")
+            logger.error(f"Error processing mention: {e}")
             await respond(
                 "Sorry, I encountered an error processing your question. "
                 "Please try again later or use the '/ask' command."

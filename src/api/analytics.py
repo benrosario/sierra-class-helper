@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
 from src.utils.paths import ANALYTICS_DB, ensure_dirs
@@ -41,6 +41,24 @@ def _connect() -> Iterator[sqlite3.Connection]:
         conn.commit()
     finally:
         conn.close()
+
+
+# SQLite writes CURRENT_TIMESTAMP as UTC text in 'YYYY-MM-DD HH:MM:SS' form, and
+# `ts` is a TEXT column, so every window comparison below is lexicographic.
+_SQLITE_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _cutoff(now: datetime, days: int) -> str:
+    """
+    Render a "N days ago" cutoff in SQLite's own timestamp format.
+
+    This must not use isoformat(). Python separates date and time with 'T'
+    (0x54), SQLite with a space (0x20), and ' ' sorts *before* 'T' — so any row
+    sharing a calendar date with the cutoff compared as older than it and
+    dropped out of the count. That silently under-reported every active-user
+    number, DAU worst of all: a message from two hours ago was excluded.
+    """
+    return (now - timedelta(days=days)).strftime(_SQLITE_TS_FORMAT)
 
 
 def init_schema() -> None:
@@ -74,18 +92,18 @@ def get_stats() -> dict:
             "SELECT COUNT(DISTINCT discord_user_id) FROM messages"
         ).fetchone()[0]
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         dau = cur.execute(
             "SELECT COUNT(DISTINCT discord_user_id) FROM messages WHERE ts >= ?",
-            ((now - timedelta(days=1)).isoformat(),),
+            (_cutoff(now, days=1),),
         ).fetchone()[0]
         wau = cur.execute(
             "SELECT COUNT(DISTINCT discord_user_id) FROM messages WHERE ts >= ?",
-            ((now - timedelta(days=7)).isoformat(),),
+            (_cutoff(now, days=7),),
         ).fetchone()[0]
         mau = cur.execute(
             "SELECT COUNT(DISTINCT discord_user_id) FROM messages WHERE ts >= ?",
-            ((now - timedelta(days=30)).isoformat(),),
+            (_cutoff(now, days=30),),
         ).fetchone()[0]
 
         first_seen_row = cur.execute("SELECT MIN(ts) FROM messages").fetchone()

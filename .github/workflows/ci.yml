@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # No OPENAI_API_KEY and no built FAISS index in CI, so the integration
+      # tests skip themselves (see tests/conftest.py). SIERRA_ENABLE_SCHEDULER
+      # is deliberately unset — otherwise importing the app would fire a real
+      # scrape against Sierra's Banner instance.
+      - name: Run tests
+        run: pytest

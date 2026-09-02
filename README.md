@@ -3,6 +3,8 @@
 
 # Sierra Class Helper
 
+[![CI](https://github.com/benrosario/sierra-class-helper/actions/workflows/ci.yml/badge.svg)](https://github.com/benrosario/sierra-class-helper/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An AI academic advisor for Sierra College. Students @-mention a Discord bot with questions like *"what CS classes are open in fall?"* or *"when does MATH 31 meet?"* and get accurate, up-to-date answers pulled from the college's live course catalog.
 
 ---
@@ -93,7 +95,7 @@ Read via `Config`, not `os.environ`. Set in `.env` locally, in the Railway dashb
 | `API_URL` | bot | ✓ in prod | Where the bot POSTs `/chat`. On Railway, wired to the api's private domain. |
 | `SIERRA_DATA_DIR` | api | ✓ in prod | `/data` on Railway (mounted volume); defaults to `.` locally |
 | `SIERRA_ENABLE_SCHEDULER` | api | ✓ in prod | Set to `1` to run the hourly refresh loop |
-| `SIERRA_ADMIN_TOKEN` | api | optional | Gates `GET /admin/stats` |
+| `SIERRA_ADMIN_TOKEN` | api | optional | Gates `GET /admin/stats`, sent as the `X-Admin-Token` header |
 | `SIERRA_BOT_CHANNEL_IDS` | bot | optional | Comma-separated Discord channel IDs the bot responds in |
 
 ---
@@ -120,7 +122,18 @@ Two Railway services from the same repo:
 | **api** | Dockerfile ([`Dockerfile.api`](Dockerfile.api)) using `mcr.microsoft.com/playwright/python` as the base image | Chromium + system libs pre-installed. Volume mounted at `/data`. |
 | **bot** | Railpack (auto-detected from `requirements.txt`) | No Dockerfile needed. Runs `python discord_bot.py`. |
 
-See [DEPLOYMENT.md](DEPLOYMENT.md) for the step-by-step setup, environment variables, and cold-start behavior.
+**Cold start.** No data files are committed, so a fresh volume starts empty. The
+api service boots, serves `/health`, and the in-process scheduler builds the
+dataset in the background: the course refresh runs 30s after boot, and professor
+ratings are fetched immediately when `professor_ratings.json` doesn't exist yet
+(otherwise they wait a full day, so redeploys don't hammer RateMyProfessors).
+The first index build takes a few minutes; `/chat` returns no matches until it
+finishes.
+
+**Service setup.** Attach a Volume to `api` at `/data` and set
+`SIERRA_DATA_DIR=/data` plus `SIERRA_ENABLE_SCHEDULER=1` on that service only —
+the bot must never run the scheduler. Point the bot's `API_URL` at
+`${{api.RAILWAY_PRIVATE_DOMAIN}}` so traffic stays on the private network.
 
 ---
 
@@ -132,3 +145,13 @@ See [DEPLOYMENT.md](DEPLOYMENT.md) for the step-by-step setup, environment varia
 | `/ask <question>` | Same, as a slash command |
 | `/search <query>` | Raw search results without LLM formatting |
 | `/clear` | Reset your 30-minute conversation context |
+
+---
+
+## License
+
+[MIT](LICENSE) — © 2026 Ben Rosario.
+
+Covers the code in this repository only. Course data is scraped from Sierra
+College's public Banner instance and professor ratings come from
+RateMyProfessors; both belong to their respective owners.

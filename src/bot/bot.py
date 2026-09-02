@@ -22,11 +22,24 @@ _PACIFIC_TZ = ZoneInfo("America/Los_Angeles")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
-if not Config.DISCORD_BOT_TOKEN:
-    raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
-DISCORD_TOKEN = Config.DISCORD_BOT_TOKEN
+# Configuration.
+#
+# API_URL resolves at import because Config.require_api_url() only raises in
+# production, where failing immediately is what we want. The bot token is
+# checked in main() instead: validating it at import made this module
+# unimportable without a token, which broke the tests that exercise the
+# formatting and history helpers anywhere there's no .env (CI, a fresh clone).
+# Same fail-fast behavior at startup, minus the import-time side effect — the
+# rule src/embeddings/core.py already follows.
 API_URL = Config.require_api_url()
+
+
+def _require_discord_token() -> str:
+    """Return the bot token, failing fast if it isn't configured."""
+    token = Config.DISCORD_BOT_TOKEN
+    if not token:
+        raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
+    return token
 
 # Bot setup with intents
 intents = discord.Intents.default()
@@ -479,7 +492,7 @@ async def main():
         await bot.add_cog(SierraClassHelper(bot))
 
         # Start the bot
-        await bot.start(DISCORD_TOKEN)
+        await bot.start(_require_discord_token())
 
 if __name__ == "__main__":
     import asyncio

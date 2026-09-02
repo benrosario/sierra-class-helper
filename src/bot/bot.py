@@ -341,8 +341,15 @@ class SierraClassHelper(commands.Cog):
 
             async with self.session.post(
                 f"{API_URL}/search",
-                json={"query": query, "num_results": 3}
+                json={"query": query, "num_results": 3},
+                # /search is rate limited on the same key as /chat. Without this
+                # header every user collapses onto the shared Railway egress IP
+                # and one person's searches would exhaust everyone's budget.
+                headers={"X-Discord-User": str(interaction.user.id)},
             ) as response:
+                if response.status == 429:
+                    await self._send_followup(interaction, RATE_LIMIT_MESSAGE)
+                    return
                 if response.status == 200:
                     result = await response.json()
                     courses = result["courses"]
@@ -398,8 +405,8 @@ async def on_ready():
 async def on_message(message):
     """Handle @mentions in the allowed channel.
 
-    Ignores DMs entirely and, when SIERRA_BOT_CHANNEL_ID is set, ignores any
-    channel other than that one. Slash commands are handled separately and
+    Ignores DMs entirely and, when SIERRA_BOT_CHANNEL_IDS is set, ignores any
+    channel not in that list. Slash commands are handled separately and
     aren't affected by this gate.
     """
     if message.author == bot.user:

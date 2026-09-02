@@ -2,8 +2,10 @@
 FastAPI server for Sierra Class Helper
 Provides REST API endpoints for course search and chat functionality
 """
+import asyncio
+import secrets
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import logging
@@ -171,41 +173,71 @@ async def health():
 
 
 @app.get("/admin/stats")
-async def admin_stats(token: str = ""):
+async def admin_stats(x_admin_token: str = Header(default="")):
     """
     Return engagement aggregates. Gated by a shared secret to keep the data
-    private. Set SIERRA_ADMIN_TOKEN in the api env and pass ?token=... when
-    calling.
+    private. Set SIERRA_ADMIN_TOKEN in the api env and pass it as a header:
+
+        curl -H "X-Admin-Token: $SIERRA_ADMIN_TOKEN" https://<api-host>/admin/stats
+
+    The token rides in a header rather than a query string so it stays out of
+    access logs, proxy logs, and browser history, and it's checked with
+    secrets.compare_digest so a wrong guess costs the same time as a right one
+    (a plain != leaks the correct prefix through timing).
     """
     if not Config.ADMIN_TOKEN:
         raise HTTPException(status_code=503, detail="Stats endpoint not configured")
-    expected = Config.ADMIN_TOKEN
-    if token != expected:
+    if not secrets.compare_digest(
+        x_admin_token.encode("utf-8"), Config.ADMIN_TOKEN.encode("utf-8")
+    ):
         raise HTTPException(status_code=403, detail="Invalid token")
     return get_stats()
 
-@app.post("/search")
-async def search(request: CourseSearchRequest):
+def _retrieve(index, query: str, num_courses: int) -> tuple[list[dict], list[dict]]:
     """
-    Search for courses using semantic similarity
+    The blocking half of a request: embed the query (a synchronous OpenAI HTTP
+    call), scan FAISS, run the lexical channel, fuse, then expand to sections.
 
-    Returns raw course data without LLM processing
+    Kept as one plain function so the endpoints can hand the whole thing to a
+    worker thread in a single `asyncio.to_thread` hop — and so `index` is
+    snapshotted by the caller and used consistently across both steps, even if
+    a scheduler refresh swaps the singleton mid-request.
+    """
+    top_courses = index.search(query, k=num_courses)
+    return top_courses, index.all_sections_for(top_courses)
+
+
+@app.post("/search")
+@limiter.limit("30/minute")
+@limiter.limit("300/day")
+async def search(request: Request, body: CourseSearchRequest):
+    """
+    Search for courses using semantic similarity.
+
+    Returns raw course data without LLM processing. Rate limited on the same
+    key as /chat (Discord user via X-Discord-User, falling back to IP): it
+    skips the LLM call but still spends an OpenAI embedding on every request,
+    so it can't be left open. The ceiling is higher than /chat's because it's
+    the cheaper of the two.
     """
     try:
-        logger.info(f"Searching for: {request.query}")
+        logger.info(f"Searching for: {body.query}")
         # num_results is the number of distinct courses; expand each to all of its
         # sections so students see every meeting time / instructor / CRN.
         # Snapshot the index once so a concurrent reload can't swap it mid-request.
         index = get_index()
-        courses = index.search(request.query, k=request.num_results)
-        sections = index.all_sections_for(courses)
+        # Retrieval is blocking (sync OpenAI embedding call + FAISS scan), so it
+        # runs in a worker thread rather than stalling the event loop.
+        _, sections = await asyncio.to_thread(
+            _retrieve, index, body.query, body.num_results
+        )
         # Attach each section's RateMyProfessors rating here. The bot formats the
         # /search results itself, but it runs as a separate service without the
         # ratings file, so the lookup has to happen on the API side.
         for course in sections:
             course["instructorRating"] = _primary_instructor_rating(course)
         return {
-            "query": request.query,
+            "query": body.query,
             "num_results": len(sections),
             "courses": sections,
             "data_updated_at": _data_last_updated(),
@@ -349,6 +381,11 @@ async def chat(request: Request, body: ChatRequest):
     that single response call via the system prompts — no separate
     classifier round-trips. Rate limited per Discord user (via
     X-Discord-User header) or per IP if header is absent.
+
+    Both blocking stages (retrieval, then the LLM completion) run in worker
+    threads. The OpenAI client is synchronous and FAISS is CPU-bound, so
+    calling them inline would park the event loop for the whole generation and
+    serialize every other in-flight request behind this one.
     """
     try:
         logger.info(f"Chat request: {body.message}")
@@ -357,11 +394,12 @@ async def chat(request: Request, body: ChatRequest):
         search_query = _build_search_query(body)
         # Snapshot the index once so a concurrent reload can't swap it mid-request.
         index = get_index()
-        top_courses = index.search(search_query, k=body.num_courses)
-        results = index.all_sections_for(top_courses)
+        top_courses, results = await asyncio.to_thread(
+            _retrieve, index, search_query, body.num_courses
+        )
         logger.info(f"Search returned {len(results)} sections across {len(top_courses)} courses")
 
-        return _generate_response(body, results)
+        return await asyncio.to_thread(_generate_response, body, results)
 
     except HTTPException:
         raise

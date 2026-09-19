@@ -43,6 +43,7 @@ professor_ratings.json
 course_hashes.json
 course_hashes_no_enrollment.json
 analytics.sqlite
+demo.sqlite*
 course_data/
 
 # Other

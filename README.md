@@ -97,6 +97,25 @@ Read via `Config`, not `os.environ`. Set in `.env` locally, in the Railway dashb
 | `SIERRA_ENABLE_SCHEDULER` | api | ✓ in prod | Set to `1` to run the hourly refresh loop |
 | `SIERRA_ADMIN_TOKEN` | api | optional | Gates `GET /admin/stats`, sent as the `X-Admin-Token` header |
 | `SIERRA_BOT_CHANNEL_IDS` | bot | optional | Comma-separated Discord channel IDs the bot responds in |
+| `SIERRA_BOT_API_TOKEN` | api + bot | ✓ for Discord | Random shared secret (32+ characters) protecting `/chat` and `/search` |
+| `SIERRA_GOOGLE_CLIENT_ID` | api | for demo | Google OAuth web client ID; `/demo/chat` verifies Google ID tokens for this audience |
+| `SIERRA_DEMO_ALLOWED_ORIGINS` | api | for browser demo | Comma-separated exact HTTPS website origins; no wildcards or trailing slashes |
+| `SIERRA_DEMO_DAILY_LIMIT` | api | optional | Total demo attempts per UTC day; defaults to 100 |
+
+## Website demo
+
+`POST /demo/chat` supports **three lifetime message attempts per Google account**.
+The website sends a Google ID token as a Bearer credential. The API verifies its
+signature, issuer, audience, and expiry, and uses the signed Google subject as the
+identity. Browser-supplied account IDs are never trusted. Counts survive reloads,
+fresh login tokens, and API restarts; concurrent requests cannot exceed the
+allowance. A separate daily cap limits total demo usage. See [DEMO.md](DEMO.md)
+for Google setup, browser integration, responses, and security limits.
+
+**Existing deployments:** set the same new `SIERRA_BOT_API_TOKEN` on both API and
+Discord bot before releasing this version. Unauthenticated `/chat` and `/search`
+requests are now rejected. An unset Google client ID disables the demo. The
+earlier `SIERRA_DEMO_API_TOKEN` / `X-Demo-User` contract has been removed.
 
 ---
 

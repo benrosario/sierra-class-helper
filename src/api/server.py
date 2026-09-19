@@ -5,9 +5,10 @@ Provides REST API endpoints for course search and chat functionality
 import asyncio
 import secrets
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from typing import Annotated, Literal
 import logging
 from datetime import datetime, timezone
 
@@ -19,6 +20,8 @@ from slowapi.util import get_remote_address
 from src.config import Config
 from src.api.analytics import get_stats, init_schema, record_message
 from src.api.scheduler import start_scheduler, stop_scheduler
+from src.api.demo_quota import init_demo_schema, reserve_message
+from src.api.security import RequestSizeLimitMiddleware, require_bot, require_demo
 from src.embeddings.core import get_index, course_to_text
 from src.utils.professor_ratings import get_rating, format_rating
 
@@ -27,14 +30,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 def _rate_limit_key(request: Request) -> str:
-    """
-    Key requests by Discord user when available, falling back to IP.
-
-    All bot traffic shares one Railway IP, so we can't usefully rate limit on IP
-    alone. The bot forwards the Discord user ID in X-Discord-User; for any other
-    caller we degrade to per-IP.
-    """
-    return request.headers.get("X-Discord-User") or get_remote_address(request)
+    """Only the authenticated bot dependency can set a Discord identity."""
+    return getattr(request.state, "rate_limit_key", get_remote_address(request))
 
 
 limiter = Limiter(key_func=_rate_limit_key)
@@ -47,6 +44,9 @@ async def lifespan(app: FastAPI):
     OpenAI client) and analytics schema, then start the background refresh
     scheduler when Config.ENABLE_SCHEDULER is set.
     """
+    Config.validate_api_security()
+    if Config.GOOGLE_CLIENT_ID:
+        await asyncio.to_thread(init_demo_schema)
     get_index()  # force lazy build now so the first /chat request isn't slow
     init_schema()
     if Config.ENABLE_SCHEDULER:
@@ -67,16 +67,25 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS is intentionally restrictive: the only client is the Discord bot, which calls
-# this API server-to-server (no browser involved). If a browser-based client is added
-# later, list its exact origin here.
+# Google ID tokens authenticate the public demo. Exact origins let the website
+# call it directly; CORS itself is not an authentication mechanism.
+app.add_middleware(RequestSizeLimitMiddleware)
+# CORS wraps size rejection too, so the website can read a 413 response.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],
+    allow_origins=Config.DEMO_ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-Discord-User"],
+    allow_headers=["Content-Type", "Authorization"],
 )
+
+
+@app.middleware("http")
+async def prevent_caching(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 # OpenAI client for chat calls (embeddings live in src.embeddings.core). Built
 # lazily on first use so the module imports cleanly in tests that don't hit
@@ -89,27 +98,45 @@ def _get_openai_client() -> OpenAI:
     if _openai_client is None:
         if not Config.OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY environment variable is required")
-        _openai_client = OpenAI(api_key=Config.OPENAI_API_KEY)
+        _openai_client = OpenAI(api_key=Config.OPENAI_API_KEY, timeout=45, max_retries=0)
     return _openai_client
 
 # Request/Response models
+MessageText = Annotated[str, StringConstraints(
+    strip_whitespace=True, min_length=1, max_length=Config.MAX_MESSAGE_CHARS,
+)]
+
+
 class CourseSearchRequest(BaseModel):
-    query: str
-    num_results: int = 3
+    model_config = ConfigDict(extra="forbid")
+    query: MessageText
+    num_results: int = Field(default=3, ge=1, le=5)
 
 class ConversationMessage(BaseModel):
-    role: str  # "user" or "assistant"
-    content: str
+    model_config = ConfigDict(extra="forbid")
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=Config.MAX_HISTORY_ENTRY_CHARS)
 
 class ChatRequest(BaseModel):
-    message: str
-    num_courses: int = 3
-    conversation_history: list[ConversationMessage] | None = None  # Optional: previous messages
+    model_config = ConfigDict(extra="forbid")
+    message: MessageText
+    num_courses: int = Field(default=3, ge=1, le=5)
+    conversation_history: list[ConversationMessage] | None = Field(default=None, max_length=10)
+
+    @model_validator(mode="after")
+    def bound_history(self):
+        if sum(len(msg.content) for msg in self.conversation_history or []) > Config.MAX_HISTORY_CHARS:
+            raise ValueError("Conversation history is too long")
+        return self
 
 class ChatResponse(BaseModel):
     response: str
     courses_searched: int
     data_updated_at: str | None = None  # ISO-8601 UTC timestamp of the index file's last write
+
+
+class DemoChatResponse(ChatResponse):
+    messages_remaining: int
 
 # System prompts for the chatbot.
 #
@@ -207,7 +234,7 @@ def _retrieve(index, query: str, num_courses: int) -> tuple[list[dict], list[dic
     return top_courses, index.all_sections_for(top_courses)
 
 
-@app.post("/search")
+@app.post("/search", dependencies=[Depends(require_bot)])
 @limiter.limit("30/minute")
 @limiter.limit("300/day")
 async def search(request: Request, body: CourseSearchRequest):
@@ -221,7 +248,7 @@ async def search(request: Request, body: CourseSearchRequest):
     the cheaper of the two.
     """
     try:
-        logger.info(f"Searching for: {body.query}")
+        logger.info("Search request (%d characters)", len(body.query))
         # num_results is the number of distinct courses; expand each to all of its
         # sections so students see every meeting time / instructor / CRN.
         # Snapshot the index once so a concurrent reload can't swap it mid-request.
@@ -244,7 +271,7 @@ async def search(request: Request, body: CourseSearchRequest):
         }
     except Exception as e:
         logger.error(f"Search failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=503, detail="Search is temporarily unavailable")
 
 def _build_search_query(request: ChatRequest) -> str:
     """
@@ -319,7 +346,7 @@ def _generate_response(request: ChatRequest, results: list[dict]) -> ChatRespons
     """
     if results:
         context = "\n".join(_augment_with_ratings(course_to_text(r), r) for r in results)
-        retrieval_block = f"Retrieved courses ({len(results)}):\n{context}"
+        retrieval_block = f"Retrieved courses ({len(results)} sections; context may be truncated):\n{context[:Config.MAX_CONTEXT_CHARS]}"
     else:
         retrieval_block = "Retrieved courses: (none returned)"
 
@@ -345,9 +372,10 @@ def _generate_response(request: ChatRequest, results: list[dict]) -> ChatRespons
     completion = _get_openai_client().chat.completions.create(
         model=Config.CHAT_MODEL,
         messages=messages,
+        max_completion_tokens=Config.MAX_COMPLETION_TOKENS,
     )
 
-    logger.info(f"Generated response for: {request.message}")
+    logger.info("Generated chat response")
     return ChatResponse(
         response=completion.choices[0].message.content,
         courses_searched=len(results),
@@ -369,10 +397,29 @@ def _data_last_updated() -> str | None:
     return datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat", response_model=ChatResponse, dependencies=[Depends(require_bot)])
 @limiter.limit("20/minute")
 @limiter.limit("200/day")
 async def chat(request: Request, body: ChatRequest):
+    return await _run_chat(body, request.headers.get("X-Discord-User"))
+
+
+@app.post("/demo/chat", response_model=DemoChatResponse)
+async def demo_chat(body: ChatRequest, response: Response, user: str = Depends(require_demo)):
+    """Google-authenticated demo; three lifetime attempts per Google account."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        remaining = await asyncio.to_thread(reserve_message, user)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Demo quota unavailable")
+        raise HTTPException(503, "Demo is temporarily unavailable")
+    result = await _run_chat(body)
+    return DemoChatResponse(**result.model_dump(), messages_remaining=remaining)
+
+
+async def _run_chat(body: ChatRequest, discord_user: str | None = None) -> ChatResponse:
     """
     Chat endpoint that searches courses and generates AI response.
 
@@ -388,8 +435,8 @@ async def chat(request: Request, body: ChatRequest):
     serialize every other in-flight request behind this one.
     """
     try:
-        logger.info(f"Chat request: {body.message}")
-        record_message(request.headers.get("X-Discord-User"), len(body.message))
+        logger.info("Chat request (%d characters)", len(body.message))
+        await asyncio.to_thread(record_message, discord_user, len(body.message))
 
         search_query = _build_search_query(body)
         # Snapshot the index once so a concurrent reload can't swap it mid-request.
@@ -405,7 +452,7 @@ async def chat(request: Request, body: ChatRequest):
         raise
     except Exception as e:
         logger.error(f"Chat failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=503, detail="Chat is temporarily unavailable")
 
 if __name__ == "__main__":
     import uvicorn

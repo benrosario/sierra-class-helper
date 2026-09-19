@@ -32,6 +32,9 @@ Thumbs.db
 .env
 .env.local
 
+# Persistent demo quotas belong on the mounted API volume, never in uploads.
+demo.sqlite*
+
 # Git
 .git/
 .gitignore

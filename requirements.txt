@@ -11,6 +11,8 @@ fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
 slowapi>=0.1.9
+google-auth[requests]>=2.58,<3
+cachecontrol>=0.14,<1
 
 # Discord Bot
 discord.py>=2.3.0

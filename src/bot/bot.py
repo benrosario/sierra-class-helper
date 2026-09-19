@@ -41,6 +41,26 @@ def _require_discord_token() -> str:
         raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
     return token
 
+
+def _api_headers(user_id: int) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {Config.require_bot_api_token()}",
+        "X-Discord-User": str(user_id),
+    }
+
+
+def _api_history(history: list[dict]) -> list[dict]:
+    """Keep recent turns inside the API's input budget, without internal timestamps."""
+    prior = []
+    remaining = Config.MAX_HISTORY_CHARS
+    for entry in reversed(history[-10:]):
+        content = entry["content"][:Config.MAX_HISTORY_ENTRY_CHARS]
+        if len(content) > remaining:
+            break
+        prior.append({"role": entry["role"], "content": content})
+        remaining -= len(content)
+    return list(reversed(prior))
+
 # Bot setup with intents
 intents = discord.Intents.default()
 intents.message_content = True
@@ -259,10 +279,7 @@ class SierraClassHelper(commands.Cog):
         try:
             # Snapshot the prior turns (already TTL-pruned) before adding this
             # message, and strip the internal 'ts' the API doesn't expect.
-            prior = [
-                {"role": entry["role"], "content": entry["content"]}
-                for entry in self.get_user_history(user_id)
-            ]
+            prior = _api_history(self.get_user_history(user_id))
             self.add_to_history(user_id, "user", message)
 
             request_data = {
@@ -274,7 +291,7 @@ class SierraClassHelper(commands.Cog):
             async with self.session.post(
                 f"{API_URL}/chat",
                 json=request_data,
-                headers={"X-Discord-User": str(user_id)}
+                headers=_api_headers(user_id)
             ) as response:
                 if response.status == 200:
                     result = await response.json()
@@ -358,7 +375,7 @@ class SierraClassHelper(commands.Cog):
                 # /search is rate limited on the same key as /chat. Without this
                 # header every user collapses onto the shared Railway egress IP
                 # and one person's searches would exhaust everyone's budget.
-                headers={"X-Discord-User": str(interaction.user.id)},
+                headers=_api_headers(interaction.user.id),
             ) as response:
                 if response.status == 429:
                     await self._send_followup(interaction, RATE_LIMIT_MESSAGE)
@@ -487,6 +504,7 @@ async def on_message(message):
 
 async def main():
     """Main function to start the bot"""
+    Config.require_bot_api_token()
     async with bot:
         # Add cog
         await bot.add_cog(SierraClassHelper(bot))

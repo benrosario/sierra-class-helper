@@ -13,11 +13,14 @@ class TestSearchEndpoint:
     """Integration tests for POST /search endpoint"""
 
     @pytest.fixture
-    def client(self):
+    def client(self, monkeypatch):
         """Create test client for API"""
         from fastapi.testclient import TestClient
         from src.api.server import app
-        return TestClient(app)
+        from src.config import Config
+        token = "integration-test-token-" + "a" * 32
+        monkeypatch.setattr(Config, "BOT_API_TOKEN", token)
+        return TestClient(app, headers={"Authorization": f"Bearer {token}"})
 
     def test_search_basic_query(self, client):
         """Should return courses for a basic query"""
@@ -56,11 +59,14 @@ class TestChatEndpoint:
     """Integration tests for POST /chat endpoint"""
 
     @pytest.fixture
-    def client(self):
+    def client(self, monkeypatch):
         """Create test client for API"""
         from fastapi.testclient import TestClient
         from src.api.server import app
-        return TestClient(app)
+        from src.config import Config
+        token = "integration-test-token-" + "a" * 32
+        monkeypatch.setattr(Config, "BOT_API_TOKEN", token)
+        return TestClient(app, headers={"Authorization": f"Bearer {token}"})
 
     def test_chat_course_question(self, client):
         """Should return response with courses for course questions"""

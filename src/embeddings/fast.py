@@ -92,10 +92,15 @@ def fast_incremental_update():
     logger.info(f"Re-embedding needed for: {len(new_crns) + len(structural_changes)} courses")
     logger.info(f"Metadata-only update for: {len(enrollment_only)} courses")
 
+    if (not new_crns and not removed_crns and not structural_changes
+            and not enrollment_only and os.path.exists(index_file)
+            and os.path.exists(metadata_file)):
+        logger.info("No course changes; keeping the existing index and metadata.")
+        return
+
     # Load existing index
     if os.path.exists(index_file) and os.path.exists(metadata_file):
         logger.info("Loading existing index...")
-        index = faiss.read_index(index_file)
         with open(metadata_file, 'r', encoding='utf-8') as f:
             id_to_course_list = json.load(f)
 
@@ -127,40 +132,29 @@ def fast_incremental_update():
             return
 
         # Slow path: Need to rebuild index
+        index = faiss.read_index(index_file)
+        if index.ntotal != len(id_to_course_list):
+            raise ValueError("FAISS index and course metadata have different lengths")
         logger.info("Rebuilding index with changes...")
         new_index = faiss.IndexFlatL2(dimension)
         new_id_to_course_list = []
 
-        # Collect courses that don't need re-embedding
-        texts_to_embed = []
-        entries_to_keep = []
-
-        for entry in id_to_course_list:
+        # Copy unchanged vectors by position; the metadata and index share order.
+        for position, entry in enumerate(id_to_course_list):
             crn = entry['crn']
 
-            if crn in removed_crns:
-                continue  # Skip removed courses
-
-            if crn in structural_changes:
-                continue  # Will re-embed below
+            if crn in removed_crns or crn in structural_changes:
+                continue
 
             if crn in enrollment_only:
-                # Update metadata but keep embedding
-                texts_to_embed.append(course_to_text(entry['course']))
-                entries_to_keep.append({"crn": crn, "course": current_courses[crn]})
+                kept_entry = {"crn": crn, "course": current_courses[crn]}
             elif crn not in new_crns:
-                # Unchanged course
-                texts_to_embed.append(course_to_text(entry['course']))
-                entries_to_keep.append(entry)
+                kept_entry = entry
+            else:
+                continue
 
-        # Get embeddings for unchanged courses
-        if texts_to_embed:
-            logger.info(f"Re-embedding {len(texts_to_embed)} unchanged courses (required for index rebuild)...")
-            embeddings = get_embeddings_batch(texts_to_embed)
-            for embedding, entry in zip(embeddings, entries_to_keep):
-                vector = np.array([embedding], dtype="float32")
-                new_index.add(vector)
-                new_id_to_course_list.append(entry)
+            new_index.add(index.reconstruct(position).reshape(1, -1))
+            new_id_to_course_list.append(kept_entry)
 
         # Process structural changes
         if structural_changes:
@@ -218,7 +212,7 @@ def fast_incremental_update():
     elapsed = (datetime.now() - start_time).total_seconds()
     logger.info(f"Update complete in {elapsed:.1f} seconds!")
 
-    total_api_calls = len(texts_to_embed) + len(structural_changes) + len(new_crns)
+    total_api_calls = len(structural_changes) + len(new_crns)
     logger.info(f"Total OpenAI API calls: {total_api_calls}")
     logger.info(f"Estimated cost: ${total_api_calls * 0.00002:.4f}")
 

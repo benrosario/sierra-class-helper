@@ -2,9 +2,13 @@ FROM mcr.microsoft.com/playwright/python:v1.62.0-noble
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y --no-install-recommends tini \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python", "api_server.py"]
+# Tini reaps Chromium children left orphaned after Playwright exits.
+CMD ["tini", "-g", "--", "python", "api_server.py"]
